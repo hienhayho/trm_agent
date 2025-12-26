@@ -17,6 +17,13 @@ from .ddp import (
     gather_metrics,
 )
 from .logger import get_logger, logger
+from .span_utils import (
+    SpanPosition,
+    NO_SPAN,
+    find_span_in_text,
+    char_span_to_token_span,
+    find_value_token_span,
+)
 
 __all__ = [
     # Data processing
@@ -36,4 +43,10 @@ __all__ = [
     "barrier",
     "all_reduce_sum",
     "gather_metrics",
+    # Span utilities
+    "SpanPosition",
+    "NO_SPAN",
+    "find_span_in_text",
+    "char_span_to_token_span",
+    "find_value_token_span",
 ]

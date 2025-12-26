@@ -49,6 +49,8 @@ class TRMConfig:
     tool_loss_weight: float = 1.0
     slots_loss_weight: float = 0.5
     q_loss_weight: float = 0.5
+    slot_span_loss_weight: float = 0.5
+    arg_span_loss_weight: float = 0.5
 
     # Focal Loss parameters (for imbalanced decision classification)
     focal_alpha: float = 0.25

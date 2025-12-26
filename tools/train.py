@@ -231,13 +231,7 @@ def main():
         "--output-dir",
         type=str,
         default="outputs",
-        help="Output directory for model and logs",
-    )
-    parser.add_argument(
-        "--checkpoint-dir",
-        type=str,
-        default="checkpoints",
-        help="Directory for checkpoints",
+        help="Output directory for model, checkpoints and logs",
     )
 
     # Training arguments
@@ -275,6 +269,12 @@ def main():
         type=int,
         default=None,
         help="Number of warmup steps",
+    )
+    parser.add_argument(
+        "--log-sample-interval",
+        type=int,
+        default=None,
+        help="Log sample predictions every N steps (0 = disabled)",
     )
 
     # Model arguments
@@ -347,9 +347,10 @@ def main():
         training_config_dict["learning_rate"] = args.learning_rate
     if args.warmup_steps:
         training_config_dict["warmup_steps"] = args.warmup_steps
+    if args.log_sample_interval is not None:
+        training_config_dict["log_sample_interval"] = args.log_sample_interval
 
     training_config_dict["output_dir"] = args.output_dir
-    training_config_dict["checkpoint_dir"] = args.checkpoint_dir
 
     # Create configs
     model_config = TRMConfig(**model_config_dict)
@@ -487,6 +488,7 @@ def main():
         device=device,
         tool_names=list(full_dataset.tool_name_to_id.keys()),
         slot_fields=model_config.slot_fields,
+        tokenizer=tokenizer,
     )
 
     # Resume from checkpoint if specified

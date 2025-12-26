@@ -164,6 +164,68 @@ class TRMTokenizer:
 
         return ids
 
+    def encode_with_offsets(
+        self,
+        text: str,
+        add_bos: bool = False,
+        add_eos: bool = False,
+    ) -> dict[str, list]:
+        """Encode text and return token IDs with character offsets.
+
+        Args:
+            text: Text to encode
+            add_bos: Whether to add BOS token
+            add_eos: Whether to add EOS token
+
+        Returns:
+            Dictionary with:
+            - input_ids: Token IDs
+            - offsets: List of (char_start, char_end) for each token
+        """
+        if self.sp_model is None:
+            raise RuntimeError("Tokenizer not loaded. Call load() first.")
+
+        # Get pieces and IDs
+        pieces = self.sp_model.EncodeAsPieces(text)
+        ids = self.sp_model.EncodeAsIds(text)
+
+        # Build offset mapping by tracking position in original text
+        offsets = []
+        current_pos = 0
+
+        for piece in pieces:
+            # SentencePiece uses ▁ (U+2581) to mark word boundaries
+            clean_piece = piece.replace("\u2581", "")
+
+            if not clean_piece:
+                # Empty piece (just the word boundary marker)
+                # Skip whitespace in original text
+                while current_pos < len(text) and text[current_pos] == " ":
+                    current_pos += 1
+                offsets.append((current_pos, current_pos))
+            else:
+                # Handle word boundary marker (indicates space before)
+                if piece.startswith("\u2581"):
+                    while current_pos < len(text) and text[current_pos] == " ":
+                        current_pos += 1
+
+                # Find this piece in the text from current position
+                start = current_pos
+                end = start + len(clean_piece)
+                offsets.append((start, end))
+                current_pos = end
+
+        result = {"input_ids": ids, "offsets": offsets}
+
+        if add_bos:
+            result["input_ids"] = [self.bos_token_id] + result["input_ids"]
+            result["offsets"] = [(-1, -1)] + result["offsets"]
+        if add_eos:
+            result["input_ids"] = result["input_ids"] + [self.eos_token_id]
+            result["offsets"] = result["offsets"] + [(-1, -1)]
+
+        return result
+
     def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
         """Decode token IDs to text.
 
@@ -239,6 +301,94 @@ class TRMTokenizer:
             "input_ids": input_ids,
             "role_ids": role_ids,
             "attention_mask": attention_mask,
+        }
+
+    def encode_conversation_with_offsets(
+        self,
+        history: list[dict],
+        max_length: Optional[int] = None,
+    ) -> dict[str, list]:
+        """Encode conversation history with role tokens and character offsets.
+
+        This is used for span extraction where we need to map values
+        back to token positions.
+
+        Args:
+            history: List of conversation turns
+            max_length: Maximum sequence length
+
+        Returns:
+            Dictionary with:
+            - input_ids: Token IDs
+            - role_ids: Role IDs for each position
+            - attention_mask: Attention mask
+            - offsets: List of (char_start, char_end) for each token
+            - full_text: The concatenated text for span search
+        """
+        input_ids = [self.bos_token_id]
+        role_ids = [0]
+        offsets = [(-1, -1)]  # BOS has no text span
+
+        # Build full text for span searching
+        full_text_parts = []
+        current_char_offset = 0
+
+        for turn in history:
+            role = turn.get("role", "user")
+            content = turn.get("content", "")
+
+            if isinstance(content, dict):
+                content = str(content)
+
+            # Add role token (no text representation)
+            role_token_id = self.get_role_token_id(role)
+            input_ids.append(role_token_id)
+            role_ids.append(self.get_role_id(role))
+            offsets.append((-1, -1))  # Role token has no text span
+
+            # Encode content with offsets
+            if content:
+                encoded = self.encode_with_offsets(content)
+                content_ids = encoded["input_ids"]
+                content_offsets = encoded["offsets"]
+
+                # Adjust offsets by current position in full text
+                adjusted_offsets = [
+                    (start + current_char_offset, end + current_char_offset)
+                    if start >= 0
+                    else (-1, -1)
+                    for start, end in content_offsets
+                ]
+
+                input_ids.extend(content_ids)
+                role_ids.extend([self.get_role_id(role)] * len(content_ids))
+                offsets.extend(adjusted_offsets)
+
+                full_text_parts.append(content)
+                current_char_offset += len(content) + 1  # +1 for separator
+
+        # Add EOS
+        input_ids.append(self.eos_token_id)
+        role_ids.append(0)
+        offsets.append((-1, -1))
+
+        # Join full text with spaces
+        full_text = " ".join(full_text_parts)
+
+        # Truncate if needed
+        if max_length is not None and len(input_ids) > max_length:
+            input_ids = input_ids[:max_length]
+            role_ids = role_ids[:max_length]
+            offsets = offsets[:max_length]
+
+        attention_mask = [1] * len(input_ids)
+
+        return {
+            "input_ids": input_ids,
+            "role_ids": role_ids,
+            "attention_mask": attention_mask,
+            "offsets": offsets,
+            "full_text": full_text,
         }
 
     def encode_tool_call(

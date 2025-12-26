@@ -19,15 +19,21 @@ class TRMCollator:
         self,
         pad_token_id: int = 0,
         max_seq_len: int = 2048,
+        num_slots: int = 6,
+        max_tool_args: int = 10,
     ):
         """Initialize collator.
 
         Args:
             pad_token_id: Token ID for padding
             max_seq_len: Maximum sequence length
+            num_slots: Number of slot fields
+            max_tool_args: Maximum number of tool arguments
         """
         self.pad_token_id = pad_token_id
         self.max_seq_len = max_seq_len
+        self.num_slots = num_slots
+        self.max_tool_args = max_tool_args
 
     def __call__(self, batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         """Collate a batch of samples.
@@ -61,6 +67,13 @@ class TRMCollator:
         num_slots = len(batch[0]["slot_presence_labels"])
         slot_presence_labels = torch.zeros((batch_size, num_slots), dtype=torch.float)
 
+        # Span labels (slot and argument)
+        slot_start_labels = torch.full((batch_size, num_slots), -1, dtype=torch.long)
+        slot_end_labels = torch.full((batch_size, num_slots), -1, dtype=torch.long)
+        max_args = len(batch[0]["arg_start_labels"])
+        arg_start_labels = torch.full((batch_size, max_args), -1, dtype=torch.long)
+        arg_end_labels = torch.full((batch_size, max_args), -1, dtype=torch.long)
+
         # Fill in batch tensors
         for i, sample in enumerate(batch):
             seq_len = min(len(sample["input_ids"]), max_len)
@@ -73,6 +86,12 @@ class TRMCollator:
             tool_name_labels[i] = sample["tool_name_label"]
             slot_presence_labels[i] = sample["slot_presence_labels"]
 
+            # Span labels (already fixed size, just copy)
+            slot_start_labels[i] = sample["slot_start_labels"]
+            slot_end_labels[i] = sample["slot_end_labels"]
+            arg_start_labels[i] = sample["arg_start_labels"]
+            arg_end_labels[i] = sample["arg_end_labels"]
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -80,6 +99,10 @@ class TRMCollator:
             "decision_labels": decision_labels,
             "tool_name_labels": tool_name_labels,
             "slot_presence_labels": slot_presence_labels,
+            "slot_start_labels": slot_start_labels,
+            "slot_end_labels": slot_end_labels,
+            "arg_start_labels": arg_start_labels,
+            "arg_end_labels": arg_end_labels,
         }
 
 

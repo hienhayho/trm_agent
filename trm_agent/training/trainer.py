@@ -9,10 +9,14 @@ Implements the training loop with:
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from trm_agent.data import TRMTokenizer
+
 from rich.console import Console
 from rich.table import Table
 from torch.optim import AdamW
@@ -64,27 +68,41 @@ class TrainingConfig:
     log_interval: int = 10
     eval_interval: int = 500
     save_interval: int = 1000
+    log_sample_interval: int = 0  # Log sample predictions every N steps (0 = disabled)
 
     # Paths
     output_dir: str = "outputs"
-    checkpoint_dir: str = "checkpoints"
 
 
-def get_linear_warmup_scheduler(
+def get_cosine_warmup_scheduler(
     optimizer: AdamW,
     warmup_steps: int,
     total_steps: int,
+    min_lr_ratio: float = 0.1,
 ) -> LambdaLR:
-    """Create linear warmup scheduler.
+    """Create linear warmup + cosine decay scheduler.
 
     Linearly increases LR from 0 to target during warmup,
-    then keeps it constant.
+    then decays with cosine schedule to min_lr_ratio * initial_lr.
+
+    Args:
+        optimizer: Optimizer to schedule
+        warmup_steps: Number of warmup steps
+        total_steps: Total training steps
+        min_lr_ratio: Minimum LR as ratio of initial (default: 0.1 = 10%)
     """
+    import math
 
     def lr_lambda(step: int) -> float:
+        # Warmup phase
         if step < warmup_steps:
             return float(step) / float(max(1, warmup_steps))
-        return 1.0
+
+        # Cosine decay phase
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        # Decay from 1.0 to min_lr_ratio
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
 
     return LambdaLR(optimizer, lr_lambda)
 
@@ -109,6 +127,7 @@ class TRMTrainer:
         device: Optional[torch.device] = None,
         tool_names: Optional[list[str]] = None,
         slot_fields: Optional[list[str]] = None,
+        tokenizer: Optional["TRMTokenizer"] = None,
     ):
         """Initialize trainer.
 
@@ -121,6 +140,7 @@ class TRMTrainer:
             device: Device to use
             tool_names: List of tool names for logging
             slot_fields: List of slot field names for logging
+            tokenizer: Tokenizer for decoding spans (optional)
         """
         self.model = model
         self.config = config
@@ -129,6 +149,7 @@ class TRMTrainer:
         self.eval_dataloader = eval_dataloader
         self.tool_names = tool_names or []
         self.slot_fields = slot_fields or config.slot_fields
+        self.tokenizer = tokenizer
 
         # Check if model is wrapped with DDP
         self.is_ddp = hasattr(model, "module")
@@ -153,13 +174,13 @@ class TRMTrainer:
             weight_decay=training_config.weight_decay,
         )
 
-        # Scheduler
+        # Scheduler (cosine decay after warmup)
         total_steps = (
             len(train_dataloader)
             * training_config.num_epochs
             // training_config.gradient_accumulation_steps
         )
-        self.scheduler = get_linear_warmup_scheduler(
+        self.scheduler = get_cosine_warmup_scheduler(
             self.optimizer,
             training_config.warmup_steps,
             total_steps,
@@ -188,12 +209,10 @@ class TRMTrainer:
         self.global_step = 0
         self.epoch = 0
 
-        # Output directories (only create on main process)
+        # Output directory (only create on main process)
         self.output_dir = Path(training_config.output_dir)
-        self.checkpoint_dir = Path(training_config.checkpoint_dir)
         if is_main_process():
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         """Single training step with deep supervision.
@@ -225,6 +244,10 @@ class TRMTrainer:
                 batch["decision_labels"],
                 batch["tool_name_labels"],
                 batch["slot_presence_labels"],
+                batch["slot_start_labels"],
+                batch["slot_end_labels"],
+                batch["arg_start_labels"],
+                batch["arg_end_labels"],
             )
 
         # Backward pass
@@ -306,22 +329,10 @@ class TRMTrainer:
                 # Update postfix every 10 optimizer steps
                 if self.global_step % 10 == 0:
                     avg_loss = total_losses.get("total_loss", 0) / num_batches
-                    avg_decision = total_losses.get("decision_loss", 0) / num_batches
                     lr = self.scheduler.get_last_lr()[0]
                     progress_bar.set_postfix(
                         loss=f"{avg_loss:.4f}",
-                        decision=f"{avg_decision:.4f}",
                         lr=f"{lr:.2e}",
-                    )
-
-                # Logging
-                if self.global_step % self.training_config.log_interval == 0:
-                    lr = self.scheduler.get_last_lr()[0]
-                    logger.info(
-                        f"Step {self.global_step} | "
-                        f"Loss: {losses['total_loss']:.4f} | "
-                        f"Decision: {losses['decision_loss']:.4f} | "
-                        f"LR: {lr:.2e}"
                     )
 
                 # Evaluation
@@ -331,6 +342,14 @@ class TRMTrainer:
                 ):
                     eval_metrics = self.evaluate()
                     logger.info(f"Eval metrics: {eval_metrics}")
+
+                # Log sample predictions
+                if (
+                    self.training_config.log_sample_interval > 0
+                    and self.eval_dataloader is not None
+                    and self.global_step % self.training_config.log_sample_interval == 0
+                ):
+                    self._log_sample_predictions()
 
                 # Save checkpoint
                 if self.global_step % self.training_config.save_interval == 0:
@@ -371,6 +390,8 @@ class TRMTrainer:
         # Tool name accuracy (only for correct tool_call predictions)
         tool_correct = 0
         tool_total = 0
+        per_tool_correct = [0] * len(self.tool_names)
+        per_tool_total = [0] * len(self.tool_names)
 
         # Slot presence accuracy
         slot_correct = 0
@@ -378,9 +399,23 @@ class TRMTrainer:
         per_slot_correct = [0] * len(self.slot_fields)
         per_slot_total = [0] * len(self.slot_fields)
 
+        # Span extraction metrics
+        slot_span_correct = 0  # Both start and end match
+        slot_span_total = 0  # Total slots with valid labels
+        arg_span_correct = 0  # Both start and end match
+        arg_span_total = 0  # Total args with valid labels
+
         total_samples = 0
 
-        for batch in self.eval_dataloader:
+        logger.info("Starting evaluation...")
+
+        eval_progress = tqdm(
+            self.eval_dataloader,
+            desc="Evaluating",
+            disable=not is_main_process(),
+        )
+
+        for batch in eval_progress:
             batch = {k: v.to(self.device) for k, v in batch.items()}
 
             # Forward pass
@@ -418,6 +453,13 @@ class TRMTrainer:
                 tool_correct += (tool_pred[tool_mask] == tool_true[tool_mask]).sum().item()
                 tool_total += tool_mask.sum().item()
 
+                # Per-tool accuracy
+                for i in range(len(self.tool_names)):
+                    tool_i_mask = tool_true == i
+                    if tool_i_mask.any():
+                        per_tool_correct[i] += (tool_pred[tool_i_mask] == i).sum().item()
+                        per_tool_total[i] += tool_i_mask.sum().item()
+
             # Slot presence accuracy
             slot_pred = (torch.sigmoid(outputs.slot_presence_logits) > 0.5).float()
             slot_true = batch["slot_presence_labels"]
@@ -430,6 +472,37 @@ class TRMTrainer:
             for i in range(len(self.slot_fields)):
                 per_slot_correct[i] += slot_matches[:, i].sum().item()
                 per_slot_total[i] += batch_size
+
+            # Slot span extraction accuracy (only for slots with valid labels)
+            slot_start_labels = batch["slot_start_labels"]  # [batch, num_slots]
+            slot_end_labels = batch["slot_end_labels"]  # [batch, num_slots]
+            slot_start_pred = outputs.slot_start_logits.argmax(dim=1)  # [batch, num_slots]
+            slot_end_pred = outputs.slot_end_logits.argmax(dim=1)  # [batch, num_slots]
+
+            # Valid slots have start_label >= 0
+            slot_valid_mask = slot_start_labels >= 0  # [batch, num_slots]
+            if slot_valid_mask.any():
+                slot_start_match = slot_start_pred == slot_start_labels
+                slot_end_match = slot_end_pred == slot_end_labels
+                slot_span_match = slot_start_match & slot_end_match & slot_valid_mask
+                slot_span_correct += slot_span_match.sum().item()
+                slot_span_total += slot_valid_mask.sum().item()
+
+            # Argument span extraction accuracy (only for tool_call samples with valid labels)
+            if tool_mask.any():
+                arg_start_labels = batch["arg_start_labels"][tool_mask]  # [num_tool_calls, max_args]
+                arg_end_labels = batch["arg_end_labels"][tool_mask]
+                arg_start_pred = outputs.arg_start_logits[tool_mask].argmax(dim=1)  # [num_tool_calls, max_args]
+                arg_end_pred = outputs.arg_end_logits[tool_mask].argmax(dim=1)
+
+                # Valid args have start_label >= 0
+                arg_valid_mask = arg_start_labels >= 0
+                if arg_valid_mask.any():
+                    arg_start_match = arg_start_pred == arg_start_labels
+                    arg_end_match = arg_end_pred == arg_end_labels
+                    arg_span_match = arg_start_match & arg_end_match & arg_valid_mask
+                    arg_span_correct += arg_span_match.sum().item()
+                    arg_span_total += arg_valid_mask.sum().item()
 
         # Restore original weights
         if self.ema is not None:
@@ -446,11 +519,20 @@ class TRMTrainer:
             "tool_total": tool_total,
             "slot_correct": slot_correct,
             "slot_total": slot_total,
+            "slot_span_correct": slot_span_correct,
+            "slot_span_total": slot_span_total,
+            "arg_span_correct": arg_span_correct,
+            "arg_span_total": arg_span_total,
         }
         # Add per-slot metrics
         for i, field in enumerate(self.slot_fields):
             raw_metrics[f"per_slot_correct_{i}"] = per_slot_correct[i]
             raw_metrics[f"per_slot_total_{i}"] = per_slot_total[i]
+
+        # Add per-tool metrics
+        for i in range(len(self.tool_names)):
+            raw_metrics[f"per_tool_correct_{i}"] = per_tool_correct[i]
+            raw_metrics[f"per_tool_total_{i}"] = per_tool_total[i]
 
         # Reduce across GPUs
         agg = gather_metrics(raw_metrics, self.device)
@@ -465,10 +547,18 @@ class TRMTrainer:
         tool_total = int(agg["tool_total"])
         slot_correct = agg["slot_correct"]
         slot_total = int(agg["slot_total"])
+        slot_span_correct = agg["slot_span_correct"]
+        slot_span_total = int(agg["slot_span_total"])
+        arg_span_correct = agg["arg_span_correct"]
+        arg_span_total = int(agg["arg_span_total"])
 
         for i in range(len(self.slot_fields)):
             per_slot_correct[i] = agg[f"per_slot_correct_{i}"]
             per_slot_total[i] = int(agg[f"per_slot_total_{i}"])
+
+        for i in range(len(self.tool_names)):
+            per_tool_correct[i] = agg[f"per_tool_correct_{i}"]
+            per_tool_total[i] = int(agg[f"per_tool_total_{i}"])
 
         # Compute metrics
         metrics = {"eval_samples": total_samples}
@@ -493,10 +583,22 @@ class TRMTrainer:
         # Slot accuracy
         metrics["slot_accuracy"] = slot_correct / slot_total if slot_total > 0 else 0.0
 
+        # Span extraction accuracy
+        metrics["slot_span_exact_match"] = slot_span_correct / slot_span_total if slot_span_total > 0 else 0.0
+        metrics["slot_span_samples"] = slot_span_total
+        metrics["arg_span_exact_match"] = arg_span_correct / arg_span_total if arg_span_total > 0 else 0.0
+        metrics["arg_span_samples"] = arg_span_total
+
         # Per-slot accuracy
         for i, field in enumerate(self.slot_fields):
             acc = per_slot_correct[i] / per_slot_total[i] if per_slot_total[i] > 0 else 0.0
             metrics[f"slot_{field}_acc"] = acc
+
+        # Per-tool accuracy
+        for i, tool_name in enumerate(self.tool_names):
+            acc = per_tool_correct[i] / per_tool_total[i] if per_tool_total[i] > 0 else 0.0
+            metrics[f"tool_{tool_name}_acc"] = acc
+            metrics[f"tool_{tool_name}_samples"] = per_tool_total[i]
 
         # Log confusion matrix (only on main process, with aggregated values)
         self._log_confusion_matrix(decision_tp, decision_fp, decision_fn, decision_tn)
@@ -522,8 +624,376 @@ class TRMTrainer:
 
         console.print(table)
 
+    def _decode_span(self, input_ids: torch.Tensor, start: int, end: int) -> str:
+        """Decode a span from input_ids using tokenizer."""
+        if self.tokenizer is None or start < 0 or end < start:
+            return ""
+        if end >= len(input_ids):
+            end = len(input_ids) - 1
+        span_ids = input_ids[start:end + 1].tolist()
+        return self.tokenizer.decode(span_ids, skip_special_tokens=True)
+
+    def _get_arg_idx_to_name(self, dataset, tool_name: str) -> dict[int, str]:
+        """Get argument index to name mapping for a tool."""
+        if tool_name is None:
+            return {}
+
+        # Unwrap Subset if needed
+        while hasattr(dataset, 'dataset'):
+            dataset = dataset.dataset
+
+        if not hasattr(dataset, 'arg_name_to_idx'):
+            return {}
+
+        arg_name_to_idx = dataset.arg_name_to_idx
+        if tool_name not in arg_name_to_idx:
+            return {}
+
+        # Reverse the mapping: name->idx becomes idx->name
+        return {v: k for k, v in arg_name_to_idx[tool_name].items()}
+
+    @torch.no_grad()
+    def _log_sample_predictions(self):
+        """Log random tool_call and direct_answer predictions from eval dataset."""
+        if not is_main_process() or self.eval_dataloader is None:
+            return
+
+        import random
+
+        self.model.eval()
+
+        # Use EMA weights if available
+        if self.ema is not None:
+            self.ema.apply_shadow()
+
+        try:
+            # Collect all samples by type
+            tool_call_samples = []
+            direct_answer_samples = []
+
+            for batch in self.eval_dataloader:
+                batch_device = {k: v.to(self.device) for k, v in batch.items()}
+                batch_size = batch["decision_labels"].size(0)
+
+                for i in range(batch_size):
+                    is_tool_call = batch["tool_name_labels"][i].item() >= 0
+                    if is_tool_call:
+                        tool_call_samples.append((batch, i))
+                    else:
+                        direct_answer_samples.append((batch, i))
+
+            # Randomly select one of each type
+            samples_to_log = []
+            if tool_call_samples:
+                samples_to_log.append(("tool_call", random.choice(tool_call_samples)))
+            if direct_answer_samples:
+                samples_to_log.append(("direct_answer", random.choice(direct_answer_samples)))
+
+            console.print(f"\n[bold blue]═══ Sample Predictions (Step {self.global_step}) ═══[/bold blue]\n")
+
+            for sample_type, (batch, sample_idx) in samples_to_log:
+                batch_device = {k: v.to(self.device) for k, v in batch.items()}
+
+                # Forward pass
+                outputs = self.raw_model(
+                    input_ids=batch_device["input_ids"],
+                    attention_mask=batch_device["attention_mask"],
+                    role_ids=batch_device["role_ids"],
+                    return_all_steps=False,
+                )
+
+                self._log_single_sample(
+                    outputs, batch, sample_idx, sample_type
+                )
+
+            console.print("[bold blue]═══ End Sample Predictions ═══[/bold blue]\n")
+
+        finally:
+            if self.ema is not None:
+                self.ema.restore()
+
+    def _log_single_sample(
+        self,
+        outputs,
+        batch: dict[str, torch.Tensor],
+        sample_idx: int,
+        sample_type: str,
+    ):
+        """Log a single sample prediction."""
+        input_ids = batch["input_ids"][sample_idx].cpu()
+
+        # Extract predictions
+        decision_prob = torch.sigmoid(outputs.decision_logits[sample_idx]).item()
+        decision_pred = "tool_call" if decision_prob > 0.5 else "direct_answer"
+        decision_true = "tool_call" if sample_type == "tool_call" else "direct_answer"
+
+        # Build main table
+        table = Table(title=f"Sample: {sample_type}", show_header=True)
+        table.add_column("Field", style="bold")
+        table.add_column("Predicted", style="cyan")
+        table.add_column("Ground Truth", style="green")
+
+        # Decision
+        dec_match = "[green]" if decision_pred == decision_true else "[red]"
+        table.add_row("Decision", f"{dec_match}{decision_pred}[/] ({decision_prob:.3f})", decision_true)
+
+        # Tool name (for tool_call samples)
+        tool_true_idx = batch["tool_name_labels"][sample_idx].item()
+        tool_true_name = None
+        if tool_true_idx >= 0:
+            tool_pred_idx = outputs.tool_logits[sample_idx].argmax().item()
+            tool_pred_name = self.tool_names[tool_pred_idx] if tool_pred_idx < len(self.tool_names) else f"tool_{tool_pred_idx}"
+            tool_true_name = self.tool_names[tool_true_idx] if tool_true_idx < len(self.tool_names) else f"tool_{tool_true_idx}"
+            tool_match = "[green]" if tool_pred_name == tool_true_name else "[red]"
+            table.add_row("Tool Name", f"{tool_match}{tool_pred_name}[/]", tool_true_name)
+        else:
+            table.add_row("Tool Name", "-", "-")
+
+        console.print(table)
+
+        # Slot presence and spans
+        slot_probs = torch.sigmoid(outputs.slot_presence_logits[sample_idx])
+        slot_preds = (slot_probs > 0.5).tolist()
+        slot_true = batch["slot_presence_labels"][sample_idx].tolist()
+        slot_start_pred = outputs.slot_start_logits[sample_idx].argmax(dim=0).tolist()
+        slot_end_pred = outputs.slot_end_logits[sample_idx].argmax(dim=0).tolist()
+        slot_start_true = batch["slot_start_labels"][sample_idx].tolist()
+        slot_end_true = batch["slot_end_labels"][sample_idx].tolist()
+
+        slot_table = Table(title="Slot Values", show_header=True)
+        slot_table.add_column("Slot", style="bold")
+        slot_table.add_column("Present", justify="center")
+        slot_table.add_column("Predicted Value", style="cyan")
+        slot_table.add_column("True Value", style="green")
+
+        for i, field in enumerate(self.slot_fields):
+            pred_present = slot_preds[i] if i < len(slot_preds) else False
+            true_present = slot_true[i] if i < len(slot_true) else 0
+
+            if not pred_present and not true_present:
+                continue
+
+            present_str = f"P:{1 if pred_present else 0} / T:{int(true_present)}"
+
+            # Decode predicted span
+            if pred_present and i < len(slot_start_pred):
+                pred_text = self._decode_span(input_ids, slot_start_pred[i], slot_end_pred[i])
+                pred_span = f"[{slot_start_pred[i]}:{slot_end_pred[i]}]"
+                pred_val = f"{pred_text} {pred_span}" if pred_text else f"? {pred_span}"
+            else:
+                pred_val = "-"
+
+            # Decode ground truth span
+            true_start = slot_start_true[i] if i < len(slot_start_true) else -1
+            true_end = slot_end_true[i] if i < len(slot_end_true) else -1
+            if true_start >= 0:
+                true_text = self._decode_span(input_ids, true_start, true_end)
+                true_span = f"[{true_start}:{true_end}]"
+                true_val = f"{true_text} {true_span}" if true_text else f"? {true_span}"
+            else:
+                true_val = "-"
+
+            # Color based on match
+            if pred_present and true_start >= 0:
+                if slot_start_pred[i] == true_start and slot_end_pred[i] == true_end:
+                    pred_val = f"[green]{pred_val}[/]"
+                else:
+                    pred_val = f"[red]{pred_val}[/]"
+
+            slot_table.add_row(field, present_str, pred_val, true_val)
+
+        if slot_table.row_count > 0:
+            console.print(slot_table)
+
+        # Argument spans (only for tool_call samples)
+        if sample_type == "tool_call" and tool_true_name:
+            arg_start_pred = outputs.arg_start_logits[sample_idx].argmax(dim=0).tolist()
+            arg_end_pred = outputs.arg_end_logits[sample_idx].argmax(dim=0).tolist()
+            arg_start_true = batch["arg_start_labels"][sample_idx].tolist()
+            arg_end_true = batch["arg_end_labels"][sample_idx].tolist()
+
+            arg_idx_to_name = self._get_arg_idx_to_name(self.eval_dataloader.dataset, tool_true_name)
+
+            arg_table = Table(title=f"Argument Values (tool: {tool_true_name})", show_header=True)
+            arg_table.add_column("Arg Name", style="bold")
+            arg_table.add_column("Predicted Value", style="cyan")
+            arg_table.add_column("True Value", style="green")
+
+            for i in range(len(arg_start_true)):
+                true_start = arg_start_true[i]
+                true_end = arg_end_true[i]
+
+                if true_start < 0:
+                    continue
+
+                arg_name = arg_idx_to_name.get(i, f"arg_{i}")
+
+                pred_text = self._decode_span(input_ids, arg_start_pred[i], arg_end_pred[i])
+                pred_span = f"[{arg_start_pred[i]}:{arg_end_pred[i]}]"
+                pred_val = f"{pred_text} {pred_span}" if pred_text else f"? {pred_span}"
+
+                true_text = self._decode_span(input_ids, true_start, true_end)
+                true_span = f"[{true_start}:{true_end}]"
+                true_val = f"{true_text} {true_span}" if true_text else f"? {true_span}"
+
+                if arg_start_pred[i] == true_start and arg_end_pred[i] == true_end:
+                    pred_val = f"[green]{pred_val}[/]"
+                else:
+                    pred_val = f"[red]{pred_val}[/]"
+
+                arg_table.add_row(arg_name, pred_val, true_val)
+
+            if arg_table.row_count > 0:
+                console.print(arg_table)
+
+        console.print("")
+
+    def _log_data_samples(self):
+        """Log one tool_call and one direct_answer sample for debugging."""
+        if not is_main_process():
+            return
+
+        console.print("\n[bold blue]═══ Data Sample Check ═══[/bold blue]\n")
+
+        tool_call_found = False
+        direct_answer_found = False
+
+        for batch in self.train_dataloader:
+            batch_size = batch["decision_labels"].size(0)
+
+            for i in range(batch_size):
+                decision = batch["decision_labels"][i].item()
+                is_tool_call = decision == 1
+
+                # Skip if we already logged this type
+                if is_tool_call and tool_call_found:
+                    continue
+                if not is_tool_call and direct_answer_found:
+                    continue
+
+                sample_type = "tool_call" if is_tool_call else "direct_answer"
+                table = Table(title=f"Sample: {sample_type}", show_header=True)
+                table.add_column("Field", style="bold")
+                table.add_column("Value")
+
+                # Basic info
+                input_ids = batch["input_ids"][i]
+                seq_len = (batch["attention_mask"][i] == 1).sum().item()
+                table.add_row("Sequence Length", str(seq_len))
+                table.add_row("Decision Label", f"{decision} ({sample_type})")
+
+                # Decode first 100 tokens of input
+                if self.tokenizer:
+                    text = self.tokenizer.decode(input_ids[:min(100, seq_len)].tolist())
+                    text = text[:200] + "..." if len(text) > 200 else text
+                    table.add_row("Input (first 100 tokens)", text)
+
+                # Tool info
+                tool_label = batch["tool_name_labels"][i].item()
+                if tool_label >= 0:
+                    tool_name = self.tool_names[tool_label] if tool_label < len(self.tool_names) else f"tool_{tool_label}"
+                    table.add_row("Tool Name", tool_name)
+                else:
+                    table.add_row("Tool Name", "-")
+
+                # Slot presence
+                slot_presence = batch["slot_presence_labels"][i].tolist()
+                slot_str = ", ".join(
+                    f"{field}={int(slot_presence[j])}"
+                    for j, field in enumerate(self.slot_fields)
+                    if j < len(slot_presence)
+                )
+                table.add_row("Slot Presence", slot_str)
+
+                console.print(table)
+
+                # Slot spans table
+                slot_start = batch["slot_start_labels"][i].tolist()
+                slot_end = batch["slot_end_labels"][i].tolist()
+
+                span_table = Table(title=f"Slot Spans ({sample_type})", show_header=True)
+                span_table.add_column("Slot", style="bold")
+                span_table.add_column("Present")
+                span_table.add_column("Start")
+                span_table.add_column("End")
+                span_table.add_column("Decoded Value")
+
+                for j, field in enumerate(self.slot_fields):
+                    if j >= len(slot_start):
+                        break
+                    present = int(slot_presence[j]) if j < len(slot_presence) else 0
+                    start = slot_start[j]
+                    end = slot_end[j]
+
+                    if start >= 0 and self.tokenizer:
+                        decoded = self._decode_span(input_ids, start, end)
+                    else:
+                        decoded = "-"
+
+                    span_table.add_row(
+                        field,
+                        str(present),
+                        str(start) if start >= 0 else "-",
+                        str(end) if end >= 0 else "-",
+                        decoded,
+                    )
+
+                console.print(span_table)
+
+                # Argument spans (only for tool_call)
+                if is_tool_call and tool_label >= 0:
+                    arg_start = batch["arg_start_labels"][i].tolist()
+                    arg_end = batch["arg_end_labels"][i].tolist()
+
+                    # Get argument name mapping for this tool
+                    tool_name = self.tool_names[tool_label] if tool_label < len(self.tool_names) else None
+                    arg_idx_to_name = self._get_arg_idx_to_name(self.train_dataloader.dataset, tool_name)
+
+                    arg_table = Table(title=f"Argument Spans (tool: {tool_name})", show_header=True)
+                    arg_table.add_column("Arg Name", style="bold")
+                    arg_table.add_column("Index")
+                    arg_table.add_column("Start")
+                    arg_table.add_column("End")
+                    arg_table.add_column("Decoded Value")
+
+                    has_args = False
+                    for j in range(len(arg_start)):
+                        if arg_start[j] >= 0:
+                            has_args = True
+                            arg_name = arg_idx_to_name.get(j, f"arg_{j}")
+                            if self.tokenizer:
+                                decoded = self._decode_span(input_ids, arg_start[j], arg_end[j])
+                            else:
+                                decoded = "-"
+                            arg_table.add_row(arg_name, str(j), str(arg_start[j]), str(arg_end[j]), decoded)
+
+                    if has_args:
+                        console.print(arg_table)
+                    else:
+                        console.print("[dim]No argument spans found[/dim]")
+
+                console.print("")
+
+                # Mark as found
+                if is_tool_call:
+                    tool_call_found = True
+                else:
+                    direct_answer_found = True
+
+                # Stop if we found both
+                if tool_call_found and direct_answer_found:
+                    break
+
+            if tool_call_found and direct_answer_found:
+                break
+
+        console.print("[bold blue]═══ End Data Sample Check ═══[/bold blue]\n")
+
     def train(self):
         """Full training loop."""
+        # Log sample data for debugging
+        self._log_data_samples()
+
         logger.info(f"Starting training for {self.training_config.num_epochs} epochs")
         logger.info(f"Device: {self.device}")
         logger.info(f"Training samples: {len(self.train_dataloader.dataset)}")
@@ -578,6 +1048,15 @@ class TRMTrainer:
 
         # Overall slot accuracy
         main_table.add_row("Slot Accuracy (Overall)", f"{metrics.get('slot_accuracy', 0):.4f}")
+        main_table.add_row("", "")  # Empty row as separator
+
+        # Span extraction metrics
+        slot_span_em = metrics.get('slot_span_exact_match', 0)
+        slot_span_samples = int(metrics.get('slot_span_samples', 0))
+        arg_span_em = metrics.get('arg_span_exact_match', 0)
+        arg_span_samples = int(metrics.get('arg_span_samples', 0))
+        main_table.add_row("Slot Span EM", f"{slot_span_em:.4f} ({slot_span_samples} spans)")
+        main_table.add_row("Arg Span EM", f"{arg_span_em:.4f} ({arg_span_samples} spans)")
 
         console.print(main_table)
 
@@ -603,13 +1082,43 @@ class TRMTrainer:
 
         console.print(slot_table)
 
+        # Per-tool accuracy table
+        if self.tool_names:
+            tool_table = Table(
+                title="Per-Tool Accuracy",
+                show_header=True,
+                header_style="bold magenta",
+            )
+            tool_table.add_column("Tool Name", style="bold")
+            tool_table.add_column("Accuracy", justify="right")
+            tool_table.add_column("Samples", justify="right")
+
+            for tool_name in self.tool_names:
+                acc = metrics.get(f"tool_{tool_name}_acc", 0)
+                samples = int(metrics.get(f"tool_{tool_name}_samples", 0))
+                # Color code based on accuracy
+                if acc >= 0.9:
+                    acc_str = f"[green]{acc:.4f}[/green]"
+                elif acc >= 0.7:
+                    acc_str = f"[yellow]{acc:.4f}[/yellow]"
+                else:
+                    acc_str = f"[red]{acc:.4f}[/red]"
+                tool_table.add_row(tool_name, acc_str, str(samples))
+
+            console.print(tool_table)
+
     def save_checkpoint(self, name: Optional[str] = None):
-        """Save training checkpoint."""
+        """Save training checkpoint to output directory.
+
+        Saves:
+        - checkpoint_{name}.pt: Model weights, optimizer state, training state
+        - config.yaml: Model configuration for inference
+        """
         if not is_main_process():
             return
 
         name = name or f"step_{self.global_step}"
-        checkpoint_path = self.checkpoint_dir / f"{name}.pt"
+        checkpoint_path = self.output_dir / f"checkpoint_{name}.pt"
 
         state = {
             "model_state_dict": self.raw_model.state_dict(),  # Use raw model for DDP
@@ -624,6 +1133,11 @@ class TRMTrainer:
             state["ema_state_dict"] = self.ema.state_dict()
 
         torch.save(state, checkpoint_path)
+
+        # Also save config as YAML for easy loading during inference
+        config_path = self.output_dir / "config.yaml"
+        self.config.to_yaml(config_path)
+
         logger.info(f"Saved checkpoint: {checkpoint_path}")
 
     def load_checkpoint(self, checkpoint_path: str | Path):

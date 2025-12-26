@@ -86,16 +86,88 @@ class FocalLoss(nn.Module):
             return focal_loss
 
 
+class SpanExtractionLoss(nn.Module):
+    """Loss for span extraction (start/end position prediction).
+
+    Each span is treated as a classification problem over sequence positions.
+    Uses CrossEntropyLoss with ignore_index=-1 for missing spans.
+    """
+
+    def __init__(self, ignore_index: int = -1):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index)
+
+    def forward(
+        self,
+        start_logits: torch.Tensor,  # [batch, seq_len, num_spans]
+        end_logits: torch.Tensor,  # [batch, seq_len, num_spans]
+        start_labels: torch.Tensor,  # [batch, num_spans]
+        end_labels: torch.Tensor,  # [batch, num_spans]
+    ) -> torch.Tensor:
+        """Compute span extraction loss.
+
+        Args:
+            start_logits: Start position logits [batch, seq_len, num_spans]
+            end_logits: End position logits [batch, seq_len, num_spans]
+            start_labels: Start position labels [batch, num_spans]
+            end_labels: End position labels [batch, num_spans]
+
+        Returns:
+            Average of start and end losses
+        """
+        batch_size, seq_len, num_spans = start_logits.shape
+
+        # Check if there are any valid labels (not all -1)
+        valid_mask = start_labels >= 0
+        if not valid_mask.any():
+            # No valid spans - return zero loss with gradient connection
+            return 0.0 * (start_logits.sum() + end_logits.sum())
+
+        # Clamp labels to valid range (0 to seq_len-1) or -1 for ignore
+        # This prevents out-of-bounds errors
+        start_labels = start_labels.clone()
+        end_labels = end_labels.clone()
+        start_labels = torch.where(
+            start_labels >= 0,
+            start_labels.clamp(0, seq_len - 1),
+            start_labels,
+        )
+        end_labels = torch.where(
+            end_labels >= 0,
+            end_labels.clamp(0, seq_len - 1),
+            end_labels,
+        )
+
+        # Transpose: [batch, seq_len, num_spans] -> [batch, num_spans, seq_len]
+        start_logits = start_logits.transpose(1, 2)
+        end_logits = end_logits.transpose(1, 2)
+
+        # Reshape for cross entropy: [batch * num_spans, seq_len]
+        start_logits = start_logits.reshape(-1, seq_len)
+        end_logits = end_logits.reshape(-1, seq_len)
+
+        # Flatten labels: [batch * num_spans]
+        start_labels = start_labels.view(-1)
+        end_labels = end_labels.view(-1)
+
+        # Compute losses (ignore_index=-1 handles missing spans)
+        start_loss = self.ce_loss(start_logits, start_labels)
+        end_loss = self.ce_loss(end_logits, end_labels)
+
+        return (start_loss + end_loss) / 2
+
+
 class TRMLoss(nn.Module):
     """Combined loss for TRM training.
 
-    Phase 1 training focuses on:
+    Includes:
     - Decision accuracy (tool_call vs direct_answer) with Focal Loss
     - Tool name prediction (when decision is tool_call)
     - Slot presence prediction
+    - Slot span extraction
+    - Tool argument span extraction
     - Q head for halting (ACT)
-
-    Content generation is NOT trained in Phase 1.
     """
 
     def __init__(self, config: TRMConfig):
@@ -117,11 +189,17 @@ class TRMLoss(nn.Module):
         # BCE for Q head (halting)
         self.q_loss = nn.BCEWithLogitsLoss()
 
+        # Span extraction losses
+        self.slot_span_loss = SpanExtractionLoss(ignore_index=-1)
+        self.arg_span_loss = SpanExtractionLoss(ignore_index=-1)
+
         # Loss weights
         self.decision_weight = config.decision_loss_weight
         self.tool_weight = config.tool_loss_weight
         self.slot_weight = config.slots_loss_weight
         self.q_weight = config.q_loss_weight
+        self.slot_span_weight = config.slot_span_loss_weight
+        self.arg_span_weight = config.arg_span_loss_weight
 
     def forward(
         self,
@@ -129,6 +207,10 @@ class TRMLoss(nn.Module):
         decision_labels: torch.Tensor,
         tool_name_labels: torch.Tensor,
         slot_presence_labels: torch.Tensor,
+        slot_start_labels: torch.Tensor,
+        slot_end_labels: torch.Tensor,
+        arg_start_labels: torch.Tensor,
+        arg_end_labels: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Compute combined loss.
 
@@ -137,6 +219,10 @@ class TRMLoss(nn.Module):
             decision_labels: Binary decision labels [batch]
             tool_name_labels: Tool name labels [batch] (-1 for non-tool_call)
             slot_presence_labels: Slot presence labels [batch, num_slots]
+            slot_start_labels: Slot span start labels [batch, num_slots]
+            slot_end_labels: Slot span end labels [batch, num_slots]
+            arg_start_labels: Argument span start labels [batch, max_args]
+            arg_end_labels: Argument span end labels [batch, max_args]
 
         Returns:
             Dictionary with individual losses and total loss
@@ -177,23 +263,38 @@ class TRMLoss(nn.Module):
         q_loss = self.q_loss(outputs.q_logits.view(-1), is_correct)
         losses["q_loss"] = q_loss
 
-        # 5. Dummy loss for unused outputs (required for DDP gradient sync)
-        # These outputs are not trained in Phase 1 but need gradients for DDP
-        # Using 0.0 weight so they don't affect training, just enable gradient flow
-        dummy_loss = 0.0 * (
-            outputs.arg_start_logits.sum()
-            + outputs.arg_end_logits.sum()
-            + outputs.slot_start_logits.sum()
-            + outputs.slot_end_logits.sum()
+        # 5. Slot span extraction loss
+        slot_span_loss = self.slot_span_loss(
+            outputs.slot_start_logits,
+            outputs.slot_end_logits,
+            slot_start_labels,
+            slot_end_labels,
         )
+        losses["slot_span_loss"] = slot_span_loss
 
-        # 6. Total loss
+        # 6. Argument span extraction loss (only for tool_call samples)
+        if tool_mask.any():
+            arg_span_loss = self.arg_span_loss(
+                outputs.arg_start_logits[tool_mask],
+                outputs.arg_end_logits[tool_mask],
+                arg_start_labels[tool_mask],
+                arg_end_labels[tool_mask],
+            )
+            losses["arg_span_loss"] = arg_span_loss
+        else:
+            # No tool_call samples - dummy loss for gradient flow
+            losses["arg_span_loss"] = 0.0 * (
+                outputs.arg_start_logits.sum() + outputs.arg_end_logits.sum()
+            )
+
+        # 7. Total loss
         total_loss = (
             self.decision_weight * losses["decision_loss"]
             + self.tool_weight * losses["tool_loss"]
             + self.slot_weight * losses["slot_loss"]
             + self.q_weight * losses["q_loss"]
-            + dummy_loss  # Enables gradient flow for all parameters
+            + self.slot_span_weight * losses["slot_span_loss"]
+            + self.arg_span_weight * losses["arg_span_loss"]
         )
         losses["total_loss"] = total_loss
 
@@ -217,6 +318,10 @@ class DeepSupervisionLoss(nn.Module):
         decision_labels: torch.Tensor,
         tool_name_labels: torch.Tensor,
         slot_presence_labels: torch.Tensor,
+        slot_start_labels: torch.Tensor,
+        slot_end_labels: torch.Tensor,
+        arg_start_labels: torch.Tensor,
+        arg_end_labels: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Compute loss over all supervision steps.
 
@@ -225,6 +330,10 @@ class DeepSupervisionLoss(nn.Module):
             decision_labels: Binary decision labels [batch]
             tool_name_labels: Tool name labels [batch]
             slot_presence_labels: Slot presence labels [batch, num_slots]
+            slot_start_labels: Slot span start labels [batch, num_slots]
+            slot_end_labels: Slot span end labels [batch, num_slots]
+            arg_start_labels: Argument span start labels [batch, max_args]
+            arg_end_labels: Argument span end labels [batch, max_args]
 
         Returns:
             Dictionary with aggregated losses
@@ -234,6 +343,8 @@ class DeepSupervisionLoss(nn.Module):
             "tool_loss": 0.0,
             "slot_loss": 0.0,
             "q_loss": 0.0,
+            "slot_span_loss": 0.0,
+            "arg_span_loss": 0.0,
             "total_loss": 0.0,
         }
 
@@ -245,6 +356,10 @@ class DeepSupervisionLoss(nn.Module):
                 decision_labels,
                 tool_name_labels,
                 slot_presence_labels,
+                slot_start_labels,
+                slot_end_labels,
+                arg_start_labels,
+                arg_end_labels,
             )
 
             for key in total_losses:

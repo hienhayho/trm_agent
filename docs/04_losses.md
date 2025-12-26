@@ -7,7 +7,7 @@ This document describes the loss functions used for training the TRM model.
 TRM training uses multiple loss functions combined into a weighted sum:
 
 ```
-Total Loss = w_d * L_decision + w_t * L_tool + w_s * L_slot + w_q * L_q
+Total Loss = w_d * L_decision + w_t * L_tool + w_s * L_slot + w_q * L_q + w_ss * L_slot_span + w_as * L_arg_span
 ```
 
 | Loss | Weight | Description |
@@ -16,6 +16,8 @@ Total Loss = w_d * L_decision + w_t * L_tool + w_s * L_slot + w_q * L_q
 | `L_tool` | 1.0 | Tool name prediction (Cross Entropy) |
 | `L_slot` | 0.5 | Slot presence prediction (BCE) |
 | `L_q` | 0.5 | Halting probability (BCE) |
+| `L_slot_span` | 0.5 | Slot value span extraction (Cross Entropy) |
+| `L_arg_span` | 0.5 | Tool argument span extraction (Cross Entropy) |
 
 ## Loss Components
 
@@ -333,6 +335,8 @@ decision_loss_weight: 1.0
 tool_loss_weight: 1.0
 slots_loss_weight: 0.5
 q_loss_weight: 0.5
+slot_span_loss_weight: 0.5
+arg_span_loss_weight: 0.5
 
 focal_alpha: 0.25
 focal_gamma: 2.0
@@ -391,30 +395,103 @@ for batch in dataloader:
     print(f"Total: {losses['total_loss']:.4f}")
 ```
 
-## Phase 1 vs Phase 2
+### 5. Span Extraction Loss
 
-### Phase 1 (Current)
+Extracts values from input context by predicting start/end token positions.
 
-Focus on decision accuracy:
+#### Purpose
+
+Instead of generating text, span extraction locates values in the input:
+- Slot values (e.g., phone number, address mentioned in conversation)
+- Tool argument values (e.g., query mentioned by user)
+
+#### Formula
+
+```
+L_span = (L_start + L_end) / 2
+
+where:
+L_start = CrossEntropy(start_logits, start_labels)
+L_end = CrossEntropy(end_logits, end_labels)
+```
+
+#### Label Format
+
+Labels are token positions (0 to seq_len-1), or -1 if not found:
+
+```python
+# Slot span labels
+slot_start_labels = [42, -1, 15, 28, -1, 7]   # [num_slots]
+slot_end_labels = [45, -1, 18, 32, -1, 12]    # [num_slots]
+
+# Argument span labels
+arg_start_labels = [42, 67, -1, -1, ...]      # [max_tool_args]
+arg_end_labels = [45, 72, -1, -1, ...]        # [max_tool_args]
+```
+
+#### Implementation
+
+```python
+class SpanExtractionLoss(nn.Module):
+    def __init__(self, ignore_index=-1):
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index)
+
+    def forward(self, start_logits, end_logits, start_labels, end_labels):
+        batch_size, seq_len, num_spans = start_logits.shape
+
+        # Transpose: [batch, seq_len, num_spans] → [batch, num_spans, seq_len]
+        start_logits = start_logits.transpose(1, 2)
+        end_logits = end_logits.transpose(1, 2)
+
+        # Reshape for cross entropy: [batch * num_spans, seq_len]
+        start_logits = start_logits.reshape(-1, seq_len)
+        end_logits = end_logits.reshape(-1, seq_len)
+
+        # Flatten labels: [batch * num_spans]
+        start_labels = start_labels.view(-1)
+        end_labels = end_labels.view(-1)
+
+        # Compute losses (ignore_index=-1 handles missing spans)
+        start_loss = self.ce_loss(start_logits, start_labels)
+        end_loss = self.ce_loss(end_logits, end_labels)
+
+        return (start_loss + end_loss) / 2
+```
+
+#### Handling Missing Spans
+
+When a value cannot be found in the input context:
+- Labels set to -1
+- CrossEntropyLoss ignores these with `ignore_index=-1`
+- No gradient contribution for unfindable values
+
+#### Slot vs Argument Spans
+
+| Type | Shape | When Computed |
+|------|-------|---------------|
+| Slot spans | `[batch, num_slots]` | Always (all samples) |
+| Arg spans | `[batch, max_args]` | Only for `tool_call` samples |
+
+## Training Phases
+
+### Current Training
+
+Full loss with span extraction:
 - Decision loss (Focal)
 - Tool loss (only for tool_call)
 - Slot presence loss
 - Q loss (halting)
+- **Slot span extraction loss** (extracting slot values)
+- **Argument span extraction loss** (extracting tool arguments)
 
-**NOT trained:**
-- Content generation (direct_answer text)
-- Argument extraction (tool arguments)
-
-### Phase 2 (Future)
+### Future Phase
 
 Add content generation:
 - Content loss (Cross Entropy over vocabulary)
-- Argument span loss (for tool arguments)
 
 ```python
-# Future Phase 2 additions
+# Future addition
 content_loss = CrossEntropyLoss(content_logits, content_labels)
-arg_span_loss = CrossEntropyLoss(arg_logits, arg_labels)
 ```
 
 ## Monitoring Training
@@ -427,6 +504,8 @@ arg_span_loss = CrossEntropyLoss(arg_logits, arg_labels)
 | `tool_loss` | Decreases (may fluctuate if few tool_call samples) |
 | `slot_loss` | Decreases |
 | `q_loss` | Starts high, decreases as model improves |
+| `slot_span_loss` | Decreases as model learns to locate values |
+| `arg_span_loss` | Decreases (only computed for tool_call samples) |
 | `total_loss` | Overall decreasing trend |
 
 ### Warning Signs
@@ -436,4 +515,6 @@ arg_span_loss = CrossEntropyLoss(arg_logits, arg_labels)
 | `decision_loss` not decreasing | Learning rate too low, or severe imbalance |
 | `tool_loss` = 0 always | No tool_call samples in batch |
 | `q_loss` stuck at ~0.69 | Model predicting random (log(2) ≈ 0.69) |
+| `slot_span_loss` not decreasing | Values not in context, or offset mapping issues |
+| `arg_span_loss` not decreasing | Few tool_call samples, or value not in context |
 | Loss exploding | Learning rate too high, gradient issues |

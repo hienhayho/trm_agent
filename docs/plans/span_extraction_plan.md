@@ -1,5 +1,7 @@
 # Span Extraction for Tool Arguments and Slot Values
 
+**Status**: ✅ COMPLETED
+
 ## Overview
 
 Add span extraction capability to TRM model to extract tool argument values and slot values from input context by predicting start/end token positions.

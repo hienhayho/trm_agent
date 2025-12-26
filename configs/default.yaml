@@ -3,9 +3,9 @@
 
 model:
   # Architecture
-  hidden_size: 256
+  hidden_size: 512
   num_layers: 2  # Paper finding: 2 layers is optimal
-  num_heads: 4
+  num_heads: 8
   intermediate_size: 2048
   dropout: 0.1
   use_attention: true  # Set false for MLP-Mixer (better for small fixed context)
@@ -18,7 +18,7 @@ model:
   # TRM specific
   n_latent_recursion: 6  # n: latent reasoning iterations
   T_deep_recursion: 3    # T: deep recursion iterations
-  N_supervision: 8      # N_sup: max supervision steps
+  N_supervision: 4      # N_sup: max supervision steps
 
   # Output dimensions
   num_tools: 10
@@ -85,4 +85,3 @@ training:
 
   # Paths
   output_dir: outputs
-  checkpoint_dir: checkpoints
