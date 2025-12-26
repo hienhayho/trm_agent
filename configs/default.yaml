@@ -1,0 +1,88 @@
+# TRM Default Configuration
+# Based on the paper "Less is More: Recursive Reasoning with Tiny Networks"
+
+model:
+  # Architecture
+  hidden_size: 256
+  num_layers: 2  # Paper finding: 2 layers is optimal
+  num_heads: 4
+  intermediate_size: 2048
+  dropout: 0.1
+  use_attention: true  # Set false for MLP-Mixer (better for small fixed context)
+
+  # Vocabulary
+  vocab_size: 32000
+  max_seq_len: 1024
+  pad_token_id: 0
+
+  # TRM specific
+  n_latent_recursion: 6  # n: latent reasoning iterations
+  T_deep_recursion: 3    # T: deep recursion iterations
+  N_supervision: 8      # N_sup: max supervision steps
+
+  # Output dimensions
+  num_tools: 10
+  num_slots: 6
+  max_tool_args: 10
+  max_arg_len: 128
+
+  # Role tokens
+  num_roles: 4
+
+  # Training
+  ema_decay: 0.999
+
+  # Loss weights
+  decision_loss_weight: 1.0
+  tool_loss_weight: 1.0
+  slots_loss_weight: 0.5
+  q_loss_weight: 0.5
+
+  # Focal Loss (for imbalanced decision classification)
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+
+  # Slot fields
+  slot_fields:
+    - address
+    - phone
+    - device_number
+    - intent_of_user
+    - name
+    - contract_id
+
+training:
+  # Optimizer (from paper)
+  learning_rate: 1.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+
+  # Scheduler
+  warmup_steps: 2000
+  num_epochs: 100
+
+  # Training
+  batch_size: 8  # Reduced for memory (use gradient_accumulation to simulate larger batch)
+  gradient_accumulation_steps: 4  # Effective batch size = 8 * 4 = 32
+
+  # Memory optimization
+  use_amp: true  # Automatic Mixed Precision - reduces memory ~50%
+  amp_dtype: float16  # or bfloat16 for newer GPUs
+
+  # EMA
+  use_ema: true
+  ema_decay: 0.999
+
+  # ACT
+  use_act: true
+
+  # Logging
+  log_interval: 100
+  eval_interval: 500
+  save_interval: 1000
+
+  # Paths
+  output_dir: outputs
+  checkpoint_dir: checkpoints
