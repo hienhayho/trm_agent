@@ -5,12 +5,20 @@ description = "TRM (Tiny Recursive Model) aware language model training for tool
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "chainlit>=2.9.4",
+    "openai>=2.14.0",
     "pyyaml>=6.0.3",
     "rich>=14.2.0",
     "sentencepiece>=0.2.1",
     "torch>=2.9.1",
     "tqdm>=4.67.1",
     "transformers>=4.57.3",
+]
+
+[project.optional-dependencies]
+chat = [
+    "chainlit>=1.0.0",
+    "openai>=1.0.0",
 ]
 
 [build-system]

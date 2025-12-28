@@ -2,8 +2,8 @@
 
 Output heads for the TRM model:
 - DecisionHead: tool_call vs direct_answer (binary classification)
-- ToolHead: Tool name and arguments prediction
-- SlotsHead: Slot extraction from context
+- ToolHead: Tool name prediction
+- UnifiedParamHead: Unified extraction for slots + tool params with masking
 - QHead: Halting probability for ACT (Adaptive Computational Time)
 - ContentHead: Response generation (not trained in Phase 1)
 """
@@ -51,9 +51,8 @@ class DecisionHead(nn.Module):
 class ToolHead(nn.Module):
     """Tool prediction head.
 
-    Predicts:
-    - Tool name (classification over available tools)
-    - Tool arguments (sequence generation or extraction)
+    Predicts tool name (classification over available tools).
+    Argument extraction is now handled by SharedParamHead.
     """
 
     def __init__(self, config: TRMConfig):
@@ -69,103 +68,84 @@ class ToolHead(nn.Module):
             nn.Linear(config.hidden_size // 2, config.num_tools, bias=False),
         )
 
-        # Argument extractor (predicts argument values as token indices)
-        # For simplicity, we predict start/end positions for each argument
-        self.arg_start_classifier = nn.Linear(
-            config.hidden_size, config.max_tool_args, bias=False
-        )
-        self.arg_end_classifier = nn.Linear(
-            config.hidden_size, config.max_tool_args, bias=False
-        )
-
-    def forward(
-        self, y: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        """Predict tool name and arguments.
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        """Predict tool name.
 
         Args:
             y: Answer embedding [batch, seq_len, hidden_size]
 
         Returns:
-            Dictionary with:
-            - tool_logits: [batch, num_tools]
-            - arg_start_logits: [batch, seq_len, max_tool_args]
-            - arg_end_logits: [batch, seq_len, max_tool_args]
+            Tool logits [batch, num_tools]
         """
         y = self.norm(y)
 
         # Tool name prediction (pooled)
         y_pooled = y.mean(dim=1)  # [batch, hidden_size]
-        tool_logits = self.tool_classifier(y_pooled)
-
-        # Argument position prediction (per token)
-        arg_start_logits = self.arg_start_classifier(y)
-        arg_end_logits = self.arg_end_classifier(y)
-
-        return {
-            "tool_logits": tool_logits,
-            "arg_start_logits": arg_start_logits,
-            "arg_end_logits": arg_end_logits,
-        }
+        return self.tool_classifier(y_pooled)
 
 
-class SlotsHead(nn.Module):
-    """Slot extraction head.
+class UnifiedParamHead(nn.Module):
+    """Unified parameter extraction head.
 
-    Extracts slot values from the conversation context.
-    Each slot is predicted as a span (start, end) in the input.
+    Combines slot extraction and tool param extraction into one head.
+    Uses decision-based + tool-based masking during loss computation:
+    - direct_answer: only slot fields valid (first num_slots)
+    - tool_call: slot fields + tool-specific params valid
+
+    The unified_fields = slot_fields + tool_param_fields (deduplicated).
+    Slots are always extracted regardless of decision.
+    Tool params are only valid for tool_call with tool-specific masking.
     """
 
     def __init__(self, config: TRMConfig):
         super().__init__()
         self.config = config
+        self.num_unified = config.num_unified_fields
         self.num_slots = config.num_slots
 
         self.norm = RMSNorm(config.hidden_size)
 
-        # For each slot, predict start and end positions
-        self.slot_start_classifier = nn.Linear(
-            config.hidden_size, config.num_slots, bias=False
+        # Single set of span extractors for all unified fields
+        self.start_classifier = nn.Linear(
+            config.hidden_size, self.num_unified, bias=False
         )
-        self.slot_end_classifier = nn.Linear(
-            config.hidden_size, config.num_slots, bias=False
+        self.end_classifier = nn.Linear(
+            config.hidden_size, self.num_unified, bias=False
         )
 
-        # Slot presence classifier (whether slot is filled)
-        self.slot_presence = nn.Sequential(
+        # Presence classifier (whether field is filled)
+        self.presence_classifier = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size // 2, bias=False),
             nn.GELU(),
-            nn.Linear(config.hidden_size // 2, config.num_slots, bias=False),
+            nn.Linear(config.hidden_size // 2, self.num_unified, bias=False),
         )
 
-    def forward(
-        self, y: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        """Predict slot positions and presence.
+    def forward(self, y: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Predict unified field spans and presence.
 
         Args:
             y: Answer embedding [batch, seq_len, hidden_size]
 
         Returns:
             Dictionary with:
-            - slot_start_logits: [batch, seq_len, num_slots]
-            - slot_end_logits: [batch, seq_len, num_slots]
-            - slot_presence_logits: [batch, num_slots]
+            - param_start_logits: [batch, seq_len, num_unified_fields]
+            - param_end_logits: [batch, seq_len, num_unified_fields]
+            - param_presence_logits: [batch, num_unified_fields]
         """
         y = self.norm(y)
 
-        # Slot position prediction
-        slot_start_logits = self.slot_start_classifier(y)
-        slot_end_logits = self.slot_end_classifier(y)
+        # Span prediction (per token)
+        param_start_logits = self.start_classifier(y)
+        param_end_logits = self.end_classifier(y)
 
-        # Slot presence prediction (pooled)
+        # Presence prediction (pooled)
         y_pooled = y.mean(dim=1)
-        slot_presence_logits = self.slot_presence(y_pooled)
+        param_presence_logits = self.presence_classifier(y_pooled)
 
         return {
-            "slot_start_logits": slot_start_logits,
-            "slot_end_logits": slot_end_logits,
-            "slot_presence_logits": slot_presence_logits,
+            "param_start_logits": param_start_logits,
+            "param_end_logits": param_end_logits,
+            "param_presence_logits": param_presence_logits,
         }
 
 
@@ -230,7 +210,10 @@ class ContentHead(nn.Module):
 class OutputHead(nn.Module):
     """Combined output head for TRM.
 
-    Combines all prediction heads into a single module.
+    Combines all prediction heads into a single module:
+    - DecisionHead: tool_call vs direct_answer
+    - ToolHead: which tool to call
+    - UnifiedParamHead: slots + tool params (with decision+tool masking)
     """
 
     def __init__(self, config: TRMConfig):
@@ -239,7 +222,7 @@ class OutputHead(nn.Module):
 
         self.decision_head = DecisionHead(config)
         self.tool_head = ToolHead(config)
-        self.slots_head = SlotsHead(config)
+        self.unified_param_head = UnifiedParamHead(config)
         self.content_head = ContentHead(config)  # Not trained in Phase 1
 
     def forward(
@@ -254,11 +237,11 @@ class OutputHead(nn.Module):
             Dictionary with all prediction outputs
         """
         decision_logits = self.decision_head(y)
-        tool_outputs = self.tool_head(y)
-        slots_outputs = self.slots_head(y)
+        tool_logits = self.tool_head(y)
+        param_outputs = self.unified_param_head(y)
 
         return {
             "decision_logits": decision_logits,
-            **tool_outputs,
-            **slots_outputs,
+            "tool_logits": tool_logits,
+            **param_outputs,
         }

@@ -18,3 +18,5 @@ checkpoints/
 data/*.jsonl
 data/*.json
 !data/tools.json
+data_sale.json
+.chainlit

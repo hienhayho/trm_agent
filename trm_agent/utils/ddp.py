@@ -3,6 +3,35 @@
 import os
 
 import torch
+import torch.distributed as dist
+
+
+def setup_distributed() -> tuple[int, int, torch.device]:
+    """Setup distributed training if launched with torchrun.
+
+    Returns:
+        Tuple of (rank, world_size, device)
+    """
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+
+        return rank, world_size, device
+    else:
+        # Single GPU mode
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return 0, 1, device
+
+
+def cleanup_distributed():
+    """Cleanup distributed process group."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def is_main_process() -> bool:
@@ -51,7 +80,7 @@ def is_distributed() -> bool:
     Returns:
         True if running with multiple processes.
     """
-    return get_world_size() > 1
+    return dist.is_initialized()
 
 
 def barrier():

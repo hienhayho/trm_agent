@@ -29,11 +29,10 @@ class TRMOutput:
 
     decision_logits: torch.Tensor  # [batch, 1]
     tool_logits: torch.Tensor  # [batch, num_tools]
-    arg_start_logits: torch.Tensor  # [batch, seq_len, max_tool_args]
-    arg_end_logits: torch.Tensor  # [batch, seq_len, max_tool_args]
-    slot_start_logits: torch.Tensor  # [batch, seq_len, num_slots]
-    slot_end_logits: torch.Tensor  # [batch, seq_len, num_slots]
-    slot_presence_logits: torch.Tensor  # [batch, num_slots]
+    # Unified param outputs (slots + tool_params combined)
+    param_start_logits: torch.Tensor  # [batch, seq_len, num_unified_fields]
+    param_end_logits: torch.Tensor  # [batch, seq_len, num_unified_fields]
+    param_presence_logits: torch.Tensor  # [batch, num_unified_fields]
     q_logits: torch.Tensor  # [batch, 1]
     y: torch.Tensor  # [batch, seq_len, hidden_size]
     z: torch.Tensor  # [batch, seq_len, hidden_size]
@@ -231,11 +230,9 @@ class TRMForToolCalling(nn.Module):
                     TRMOutput(
                         decision_logits=outputs["decision_logits"],
                         tool_logits=outputs["tool_logits"],
-                        arg_start_logits=outputs["arg_start_logits"],
-                        arg_end_logits=outputs["arg_end_logits"],
-                        slot_start_logits=outputs["slot_start_logits"],
-                        slot_end_logits=outputs["slot_end_logits"],
-                        slot_presence_logits=outputs["slot_presence_logits"],
+                        param_start_logits=outputs["param_start_logits"],
+                        param_end_logits=outputs["param_end_logits"],
+                        param_presence_logits=outputs["param_presence_logits"],
                         q_logits=q,
                         y=y,
                         z=z,
@@ -249,11 +246,9 @@ class TRMForToolCalling(nn.Module):
         return TRMOutput(
             decision_logits=outputs["decision_logits"],
             tool_logits=outputs["tool_logits"],
-            arg_start_logits=outputs["arg_start_logits"],
-            arg_end_logits=outputs["arg_end_logits"],
-            slot_start_logits=outputs["slot_start_logits"],
-            slot_end_logits=outputs["slot_end_logits"],
-            slot_presence_logits=outputs["slot_presence_logits"],
+            param_start_logits=outputs["param_start_logits"],
+            param_end_logits=outputs["param_end_logits"],
+            param_presence_logits=outputs["param_presence_logits"],
             q_logits=q,
             y=y,
             z=z,
@@ -308,11 +303,9 @@ class TRMForToolCalling(nn.Module):
         return TRMOutput(
             decision_logits=outputs["decision_logits"],
             tool_logits=outputs["tool_logits"],
-            arg_start_logits=outputs["arg_start_logits"],
-            arg_end_logits=outputs["arg_end_logits"],
-            slot_start_logits=outputs["slot_start_logits"],
-            slot_end_logits=outputs["slot_end_logits"],
-            slot_presence_logits=outputs["slot_presence_logits"],
+            param_start_logits=outputs["param_start_logits"],
+            param_end_logits=outputs["param_end_logits"],
+            param_presence_logits=outputs["param_presence_logits"],
             q_logits=q,
             y=y,
             z=z,

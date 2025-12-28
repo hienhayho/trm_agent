@@ -22,9 +22,9 @@ model:
 
   # Output dimensions
   num_tools: 10
-  num_slots: 6
-  max_tool_args: 10
-  max_arg_len: 128
+
+  # Content slots (always extracted, regardless of decision)
+  # slot_fields are set in code, tool_param_fields auto-collected from dataset
 
   # Role tokens
   num_roles: 4
@@ -35,21 +35,13 @@ model:
   # Loss weights
   decision_loss_weight: 1.0
   tool_loss_weight: 1.0
-  slots_loss_weight: 0.5
   q_loss_weight: 0.5
+  unified_span_loss_weight: 0.5      # Unified span extraction (slots + tool params)
+  unified_presence_loss_weight: 0.5  # Unified presence prediction
 
   # Focal Loss (for imbalanced decision classification)
   focal_alpha: 0.25
-  focal_gamma: 2.0
-
-  # Slot fields
-  slot_fields:
-    - address
-    - phone
-    - device_number
-    - intent_of_user
-    - name
-    - contract_id
+  focal_gamma: 1.5
 
 training:
   # Optimizer (from paper)

@@ -3,7 +3,7 @@
 from .config import TRMConfig
 from .embeddings import InputEmbedding, LatentEmbedding, TokenEmbedding, RoleEmbedding
 from .ema import EMA, ModelEMA
-from .heads import DecisionHead, ToolHead, SlotsHead, QHead, OutputHead
+from .heads import DecisionHead, ToolHead, UnifiedParamHead, QHead, ContentHead, OutputHead
 from .layers import RMSNorm, SwiGLU, TransformerLayer, TRMBlock
 from .trm import TRMForToolCalling, TRMOutput
 
@@ -26,8 +26,9 @@ __all__ = [
     # Heads
     "DecisionHead",
     "ToolHead",
-    "SlotsHead",
+    "UnifiedParamHead",
     "QHead",
+    "ContentHead",
     "OutputHead",
     # EMA
     "EMA",

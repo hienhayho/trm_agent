@@ -12,10 +12,16 @@ Example:
         --output-dir outputs/ \
         --tokenizer-path tokenizer/tokenizer.model
 
-    # With validation split (10% of training data):
+    # Multiple training files:
     uv run python tools/train.py \
         --config configs/default.yaml \
-        --train-data data/train.jsonl \
+        --train-data data/train1.jsonl data/train2.jsonl data/train3.jsonl \
+        --output-dir outputs/
+
+    # With validation split (10% of EACH training file):
+    uv run python tools/train.py \
+        --config configs/default.yaml \
+        --train-data data/train1.jsonl data/train2.jsonl \
         --val-split 0.1 \
         --output-dir outputs/
 
@@ -34,51 +40,28 @@ Example:
 
 import argparse
 import json
-import os
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
 import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import random_split
+from torch.utils.data import ConcatDataset, random_split
 
-from trm_agent.data import TRMCollator, TRMTokenizer, TRMToolCallingDataset
+from trm_agent.data import TRMTokenizer, TRMToolCallingDataset
 from trm_agent.data.collator import create_dataloader
 from trm_agent.models import TRMConfig, TRMForToolCalling
 from trm_agent.training import TRMTrainer
 from trm_agent.training.trainer import TrainingConfig
-from trm_agent.utils import get_logger, is_main_process, get_rank, get_world_size, barrier
+from trm_agent.utils import (
+    barrier,
+    cleanup_distributed,
+    get_logger,
+    is_distributed,
+    is_main_process,
+    setup_distributed,
+)
 
 logger = get_logger(__name__)
-
-
-def setup_distributed():
-    """Initialize distributed training environment."""
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-
-        # Initialize process group
-        dist.init_process_group(
-            backend="nccl",
-            init_method="env://",
-            world_size=world_size,
-            rank=rank,
-        )
-
-        # Set device
-        torch.cuda.set_device(local_rank)
-
-        return True, local_rank
-    return False, 0
-
-
-def cleanup_distributed():
-    """Clean up distributed training."""
-    if dist.is_initialized():
-        dist.destroy_process_group()
 
 
 def load_config(config_path: Path) -> dict:
@@ -87,70 +70,74 @@ def load_config(config_path: Path) -> dict:
         return yaml.safe_load(f)
 
 
-def extract_text_for_tokenizer(data_path: str | Path, output_path: Path) -> Path:
-    """Extract text from JSONL dataset for tokenizer training.
+def extract_text_for_tokenizer(
+    data_paths: list[str | Path],
+    output_path: Path,
+) -> Path:
+    """Extract text from JSONL datasets for tokenizer training.
 
     Args:
-        data_path: Path to JSONL training file
+        data_paths: List of paths to JSONL training files
         output_path: Path to save extracted text
 
     Returns:
         Path to the extracted text file
     """
-    logger.info(f"Extracting text from {data_path} for tokenizer training...")
+    logger.info(f"Extracting text from {len(data_paths)} file(s) for tokenizer training...")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(data_path, "r", encoding="utf-8") as f_in, \
-         open(output_path, "w", encoding="utf-8") as f_out:
+    with open(output_path, "w", encoding="utf-8") as f_out:
+        for data_path in data_paths:
+            logger.info(f"  Processing {data_path}...")
+            with open(data_path, "r", encoding="utf-8") as f_in:
+                for line in f_in:
+                    sample = json.loads(line)
 
-        for line in f_in:
-            sample = json.loads(line)
+                    # Extract text from history
+                    history = sample.get("history", [])
+                    for turn in history:
+                        content = turn.get("content", "")
+                        if isinstance(content, dict):
+                            # Tool call or tool response
+                            content = json.dumps(content, ensure_ascii=False)
+                        if content:
+                            f_out.write(content + "\n")
 
-            # Extract text from history
-            history = sample.get("history", [])
-            for turn in history:
-                content = turn.get("content", "")
-                if isinstance(content, dict):
-                    # Tool call or tool response
-                    content = json.dumps(content, ensure_ascii=False)
-                if content:
-                    f_out.write(content + "\n")
+                    # Extract text from tools
+                    tools = sample.get("tools", [])
+                    for tool in tools:
+                        if "function" in tool:
+                            func = tool["function"]
+                            if "name" in func:
+                                f_out.write(func["name"] + "\n")
+                            if "description" in func:
+                                f_out.write(func["description"] + "\n")
 
-            # Extract text from tools
-            tools = sample.get("tools", [])
-            for tool in tools:
-                if "function" in tool:
-                    func = tool["function"]
-                    if "name" in func:
-                        f_out.write(func["name"] + "\n")
-                    if "description" in func:
-                        f_out.write(func["description"] + "\n")
+                    # Extract content (for direct_answer)
+                    content = sample.get("content", "")
+                    if content:
+                        f_out.write(content + "\n")
 
-            # Extract content (for direct_answer)
-            content = sample.get("content", "")
-            if content:
-                f_out.write(content + "\n")
-
-            # Extract slot values
-            slots = sample.get("slots", {})
-            for value in slots.values():
-                if value:
-                    f_out.write(str(value) + "\n")
+                    # Extract slot values
+                    slots = sample.get("slots", {})
+                    for value in slots.values():
+                        if value:
+                            f_out.write(str(value) + "\n")
 
     logger.info(f"Text extracted to {output_path}")
     return output_path
 
 
 def train_tokenizer_from_data(
-    data_path: str | Path,
+    data_paths: list[str | Path],
     output_dir: Path,
     vocab_size: int = 32000,
 ) -> TRMTokenizer:
     """Train a tokenizer from the training data.
 
     Args:
-        data_path: Path to JSONL training file
+        data_paths: List of paths to JSONL training files
         output_dir: Directory to save tokenizer
         vocab_size: Vocabulary size
 
@@ -162,7 +149,7 @@ def train_tokenizer_from_data(
 
     # Extract text to a temporary file
     text_file = tokenizer_dir / "train_text.txt"
-    extract_text_for_tokenizer(data_path, text_file)
+    extract_text_for_tokenizer(data_paths, text_file)
 
     # Train tokenizer
     logger.info(f"Training tokenizer with vocab_size={vocab_size}...")
@@ -190,8 +177,9 @@ def main():
     parser.add_argument(
         "--train-data",
         type=str,
+        nargs="+",
         required=True,
-        help="Path to training JSONL file",
+        help="Path(s) to training JSONL file(s). Multiple files can be specified.",
     )
     parser.add_argument(
         "--val-data",
@@ -308,18 +296,16 @@ def main():
     args = parser.parse_args()
 
     # Setup distributed training
-    is_distributed, local_rank = setup_distributed()
-    if is_distributed:
-        device = torch.device(f"cuda:{local_rank}")
-        logger.info(f"Distributed training: rank {get_rank()}/{get_world_size()}, device: {device}")
+    rank, world_size, device = setup_distributed()
+    if is_distributed():
+        logger.info(f"Distributed training: rank {rank}/{world_size}, device: {device}")
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Single GPU/CPU training, device: {device}")
 
     # Set random seed
-    torch.manual_seed(args.seed + get_rank())  # Different seed per rank for data augmentation
+    torch.manual_seed(args.seed + rank)  # Different seed per rank for data augmentation
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed + get_rank())
+        torch.cuda.manual_seed_all(args.seed + rank)
 
     # Load configuration
     config_dict = {}
@@ -365,7 +351,7 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
 
     # Synchronize before tokenizer operations
-    if is_distributed:
+    if is_distributed():
         barrier()
 
     tokenizer = None
@@ -383,14 +369,14 @@ def main():
             logger.info("No tokenizer specified. Training tokenizer from dataset...")
             vocab_size = args.vocab_size or model_config.vocab_size
             train_tokenizer_from_data(
-                data_path=args.train_data,
+                data_paths=args.train_data,
                 output_dir=output_dir,
                 vocab_size=vocab_size,
             )
             tokenizer_path = output_dir / "tokenizer" / "tokenizer.model"
 
     # Wait for rank 0 to finish tokenizer training
-    if is_distributed:
+    if is_distributed():
         barrier()
 
     # Now all ranks load the tokenizer
@@ -400,15 +386,39 @@ def main():
     tokenizer = TRMTokenizer(tokenizer_path)
     logger.info(f"Loaded tokenizer from {tokenizer_path}")
 
-    # Load datasets
-    full_dataset = TRMToolCallingDataset(
-        data_path=args.train_data,
-        tokenizer=tokenizer,
-        max_seq_len=model_config.max_seq_len,
-        slot_fields=model_config.slot_fields,
-    )
-    logger.info(f"Loaded dataset: {len(full_dataset)} samples")
-    logger.info(f"Label statistics: {full_dataset.get_label_statistics()}")
+    # Load datasets from multiple files
+    all_datasets = []
+    tool_name_to_id = None  # Will be set from first dataset
+
+    for i, data_path in enumerate(args.train_data):
+        dataset = TRMToolCallingDataset(
+            data_path=data_path,
+            tokenizer=tokenizer,
+            max_seq_len=model_config.max_seq_len,
+            slot_fields=model_config.slot_fields,
+            tool_name_to_id=tool_name_to_id,  # Share tool mapping across files
+        )
+        # Get tool mapping from first dataset
+        if tool_name_to_id is None:
+            tool_name_to_id = dataset.tool_name_to_id
+
+        all_datasets.append(dataset)
+        logger.info(f"Loaded {data_path}: {len(dataset)} samples")
+
+    # Combine all datasets
+    if len(all_datasets) == 1:
+        full_dataset = all_datasets[0]
+    else:
+        full_dataset = ConcatDataset(all_datasets)
+
+    total_samples = sum(len(d) for d in all_datasets)
+    logger.info(f"Total dataset: {total_samples} samples from {len(args.train_data)} file(s)")
+
+    # Get unified field info from first dataset
+    first_dataset = all_datasets[0]
+    unified_fields = first_dataset.unified_fields
+    num_slots = first_dataset.num_slots
+    tool_param_mask = first_dataset.get_tool_param_mask_tensor()
 
     train_dataset = full_dataset
     val_dataset = None
@@ -420,27 +430,132 @@ def main():
             tokenizer=tokenizer,
             max_seq_len=model_config.max_seq_len,
             slot_fields=model_config.slot_fields,
-            tool_name_to_id=full_dataset.tool_name_to_id,
+            tool_name_to_id=tool_name_to_id,
         )
         logger.info(f"Loaded validation dataset: {len(val_dataset)} samples")
+
+        # Log val dataset extraction stats (only on main process)
+        if is_main_process():
+            logger.info("Computing validation extraction statistics...")
+            val_stats = val_dataset.get_extraction_stats()
+            logger.info(f"Validation extraction stats:")
+            logger.info(f"  Samples with missing slots: {val_stats['samples_with_missing_slots']}/{val_stats['total_samples']}")
+            logger.info(f"  Samples with missing params: {val_stats['samples_with_missing_params']}/{val_stats['total_samples']}")
     elif args.val_split is not None and args.val_split > 0:
-        # Split training data
-        val_size = int(len(full_dataset) * args.val_split)
-        train_size = len(full_dataset) - val_size
+        # Split EACH training file and combine
+        train_splits = []
+        val_splits = []
 
-        train_dataset, val_dataset = random_split(
-            full_dataset,
-            [train_size, val_size],
-            generator=torch.Generator().manual_seed(args.seed),
-        )
+        for i, dataset in enumerate(all_datasets):
+            val_size = int(len(dataset) * args.val_split)
+            train_size = len(dataset) - val_size
+
+            train_part, val_part = random_split(
+                dataset,
+                [train_size, val_size],
+                generator=torch.Generator().manual_seed(args.seed + i),
+            )
+            train_splits.append(train_part)
+            val_splits.append(val_part)
+            logger.info(
+                f"  {args.train_data[i]}: {train_size} train, {val_size} val"
+            )
+
+        # Combine splits
+        if len(train_splits) == 1:
+            train_dataset = train_splits[0]
+            val_dataset = val_splits[0]
+        else:
+            train_dataset = ConcatDataset(train_splits)
+            val_dataset = ConcatDataset(val_splits)
+
+        total_train = sum(len(s) for s in train_splits)
+        total_val = sum(len(s) for s in val_splits)
         logger.info(
-            f"Split dataset: {train_size} train, {val_size} val "
-            f"({args.val_split:.1%} validation)"
+            f"Split datasets: {total_train} train, {total_val} val "
+            f"({args.val_split:.1%} validation per file)"
         )
 
-    # Update model config with actual tool count
-    model_config.num_tools = len(full_dataset.tool_name_to_id)
+    # Update model config with actual tool count and unified fields
+    model_config.num_tools = len(tool_name_to_id)
     logger.info(f"Number of tools: {model_config.num_tools}")
+
+    # Update model config with tool_param_fields from dataset
+    model_config.set_tool_param_fields(first_dataset.tool_param_fields)
+    logger.info(f"Model unified fields: {model_config.num_unified_fields} "
+                f"({model_config.num_slots} slots + {model_config.num_tool_params} params)")
+    logger.info(f"  Slots: {model_config.slot_fields}")
+    logger.info(f"  Tool params: {model_config.tool_param_fields}")
+
+    # Log per-tool parameter masks and find duplicates with slots
+    slot_set = set(model_config.slot_fields)
+    for tool_name, tool_id in tool_name_to_id.items():
+        # Get active unique params (not in slots)
+        param_mask = first_dataset.tool_param_mask.get(tool_name, [])
+        active_params = [
+            first_dataset.tool_param_fields[i]
+            for i, m in enumerate(param_mask) if m == 1
+        ]
+
+        # Find params that were deduplicated (exist in slots)
+        # Need to get original tool params from samples
+        duplicated_params: list[str] = []
+        found_tool = False
+        for sample in first_dataset.samples:
+            for tool in sample.get("tools", []):
+                func = tool.get("function", {})
+                if func.get("name") == tool_name:
+                    raw_params = set(func.get("parameters", {}).get("properties", {}).keys())
+                    duplicated_params = sorted(raw_params & slot_set)
+                    found_tool = True
+                    break
+            if found_tool:
+                break
+
+        log_msg = f"  Tool '{tool_name}' (id={tool_id}): params={active_params}"
+        if duplicated_params:
+            log_msg += f", duplicated_with_slots={duplicated_params}"
+        logger.info(log_msg)
+
+    # Log extraction statistics (only on main process)
+    if is_main_process():
+        logger.info("Computing extraction statistics...")
+        extraction_stats = first_dataset.get_extraction_stats()
+        logger.info(f"Extraction stats (samples with missing spans):")
+        logger.info(f"  Samples with missing slots: {extraction_stats['samples_with_missing_slots']}/{extraction_stats['total_samples']}")
+        logger.info(f"  Samples with missing params: {extraction_stats['samples_with_missing_params']}/{extraction_stats['total_samples']}")
+
+        # Per-slot extraction rates
+        logger.info("  Per-slot extraction:")
+        for field, field_stats in extraction_stats["slot_extraction"].items():
+            if field_stats["total"] > 0:
+                rate = field_stats["found"] / field_stats["total"] * 100
+                logger.info(f"    {field}: {field_stats['found']}/{field_stats['total']} ({rate:.1f}%) - missing: {field_stats['missing']}")
+
+        # Per-param extraction rates
+        if extraction_stats["param_extraction"]:
+            logger.info("  Per-param extraction:")
+            for field, field_stats in extraction_stats["param_extraction"].items():
+                if field_stats["total"] > 0:
+                    rate = field_stats["found"] / field_stats["total"] * 100
+                    logger.info(f"    {field}: {field_stats['found']}/{field_stats['total']} ({rate:.1f}%) - missing: {field_stats['missing']}")
+
+        # Log examples for problematic fields (< 50% extraction rate)
+        analysis = first_dataset.analyze_extraction_failures(max_examples_per_field=2)
+        if analysis["problematic_fields"]:
+            logger.warning(f"Problematic fields with <50% extraction rate: {analysis['problematic_fields']}")
+            logger.warning("These fields may be GENERATED (not extracted from text). Consider:")
+            logger.warning("  1. Removing from slot_fields if they're not extractable")
+            logger.warning("  2. Using fuzzy matching for format variations")
+            logger.warning("  3. Treating as generation task instead of extraction")
+
+            for field in analysis["problematic_fields"]:
+                examples = analysis["examples"].get(field, [])
+                if examples:
+                    logger.warning(f"  Examples for '{field}':")
+                    for ex in examples[:2]:
+                        logger.warning(f"    Value: '{ex['value']}'")
+                        logger.warning(f"    Text: '{ex['text_snippet'][:150]}...'")
 
     # Create data loaders
     pad_token_id = tokenizer.pad_token_id if tokenizer else 0
@@ -449,7 +564,7 @@ def main():
         batch_size=training_config.batch_size,
         shuffle=True,
         pad_token_id=pad_token_id,
-        distributed=is_distributed,
+        distributed=is_distributed(),
     )
 
     val_dataloader = None
@@ -459,7 +574,7 @@ def main():
             batch_size=training_config.batch_size,
             shuffle=False,
             pad_token_id=pad_token_id,
-            distributed=is_distributed,
+            distributed=is_distributed(),
         )
 
     # Create model
@@ -469,7 +584,8 @@ def main():
     logger.info(f"Created model with {num_params:,} parameters")
 
     # Wrap with DDP if distributed
-    if is_distributed:
+    if is_distributed():
+        local_rank = device.index  # Get GPU index from device
         model = DDP(
             model,
             device_ids=[local_rank],
@@ -486,8 +602,10 @@ def main():
         train_dataloader=train_dataloader,
         eval_dataloader=val_dataloader,
         device=device,
-        tool_names=list(full_dataset.tool_name_to_id.keys()),
-        slot_fields=model_config.slot_fields,
+        tool_names=list(tool_name_to_id.keys()),
+        unified_fields=unified_fields,
+        num_slots=num_slots,
+        tool_param_mask=tool_param_mask,
         tokenizer=tokenizer,
     )
 

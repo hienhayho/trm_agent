@@ -1,6 +1,7 @@
 """Batch collation for TRM training.
 
 Handles padding and batching of variable-length sequences.
+Uses unified field labels (slots + tool params).
 """
 
 from typing import Any
@@ -12,28 +13,28 @@ class TRMCollator:
     """Collator for TRM tool-calling batches.
 
     Pads sequences to the maximum length in the batch and
-    creates proper attention masks.
+    creates proper attention masks. Uses unified field labels.
     """
 
     def __init__(
         self,
         pad_token_id: int = 0,
         max_seq_len: int = 2048,
-        num_slots: int = 6,
-        max_tool_args: int = 10,
+        num_unified_fields: int = 0,
+        max_spans_per_field: int = 4,
     ):
         """Initialize collator.
 
         Args:
             pad_token_id: Token ID for padding
             max_seq_len: Maximum sequence length
-            num_slots: Number of slot fields
-            max_tool_args: Maximum number of tool arguments
+            num_unified_fields: Number of unified fields (slots + tool_params)
+            max_spans_per_field: Maximum number of valid spans per field
         """
         self.pad_token_id = pad_token_id
         self.max_seq_len = max_seq_len
-        self.num_slots = num_slots
-        self.max_tool_args = max_tool_args
+        self.num_unified_fields = num_unified_fields
+        self.max_spans_per_field = max_spans_per_field
 
     def __call__(self, batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         """Collate a batch of samples.
@@ -63,16 +64,24 @@ class TRMCollator:
         decision_labels = torch.zeros(batch_size, dtype=torch.float)
         tool_name_labels = torch.full((batch_size,), -1, dtype=torch.long)
 
-        # Stack slot presence labels
-        num_slots = len(batch[0]["slot_presence_labels"])
-        slot_presence_labels = torch.zeros((batch_size, num_slots), dtype=torch.float)
+        # Unified field tensors
+        num_fields = len(batch[0]["unified_start_labels"])
+        unified_start_labels = torch.full((batch_size, num_fields), -1, dtype=torch.long)
+        unified_end_labels = torch.full((batch_size, num_fields), -1, dtype=torch.long)
+        unified_presence_labels = torch.zeros((batch_size, num_fields), dtype=torch.float)
 
-        # Span labels (slot and argument)
-        slot_start_labels = torch.full((batch_size, num_slots), -1, dtype=torch.long)
-        slot_end_labels = torch.full((batch_size, num_slots), -1, dtype=torch.long)
-        max_args = len(batch[0]["arg_start_labels"])
-        arg_start_labels = torch.full((batch_size, max_args), -1, dtype=torch.long)
-        arg_end_labels = torch.full((batch_size, max_args), -1, dtype=torch.long)
+        # Multi-span labels
+        max_spans = batch[0]["unified_all_start_labels"].shape[1]
+        unified_all_start_labels = torch.full(
+            (batch_size, num_fields, max_spans), -1, dtype=torch.long
+        )
+        unified_all_end_labels = torch.full(
+            (batch_size, num_fields, max_spans), -1, dtype=torch.long
+        )
+        unified_span_weights = torch.zeros(
+            (batch_size, num_fields, max_spans), dtype=torch.float
+        )
+        unified_num_spans = torch.zeros((batch_size, num_fields), dtype=torch.long)
 
         # Fill in batch tensors
         for i, sample in enumerate(batch):
@@ -84,13 +93,17 @@ class TRMCollator:
 
             decision_labels[i] = sample["decision_label"]
             tool_name_labels[i] = sample["tool_name_label"]
-            slot_presence_labels[i] = sample["slot_presence_labels"]
 
-            # Span labels (already fixed size, just copy)
-            slot_start_labels[i] = sample["slot_start_labels"]
-            slot_end_labels[i] = sample["slot_end_labels"]
-            arg_start_labels[i] = sample["arg_start_labels"]
-            arg_end_labels[i] = sample["arg_end_labels"]
+            # Unified field labels
+            unified_start_labels[i] = sample["unified_start_labels"]
+            unified_end_labels[i] = sample["unified_end_labels"]
+            unified_presence_labels[i] = sample["unified_presence_labels"]
+
+            # Multi-span labels
+            unified_all_start_labels[i] = sample["unified_all_start_labels"]
+            unified_all_end_labels[i] = sample["unified_all_end_labels"]
+            unified_span_weights[i] = sample["unified_span_weights"]
+            unified_num_spans[i] = sample["unified_num_spans"]
 
         return {
             "input_ids": input_ids,
@@ -98,11 +111,14 @@ class TRMCollator:
             "role_ids": role_ids,
             "decision_labels": decision_labels,
             "tool_name_labels": tool_name_labels,
-            "slot_presence_labels": slot_presence_labels,
-            "slot_start_labels": slot_start_labels,
-            "slot_end_labels": slot_end_labels,
-            "arg_start_labels": arg_start_labels,
-            "arg_end_labels": arg_end_labels,
+            # Unified field labels
+            "unified_start_labels": unified_start_labels,
+            "unified_end_labels": unified_end_labels,
+            "unified_presence_labels": unified_presence_labels,
+            "unified_all_start_labels": unified_all_start_labels,
+            "unified_all_end_labels": unified_all_end_labels,
+            "unified_span_weights": unified_span_weights,
+            "unified_num_spans": unified_num_spans,
         }
 
 
@@ -113,6 +129,8 @@ def create_dataloader(
     num_workers: int = 0,
     collator: TRMCollator | None = None,
     pad_token_id: int = 0,
+    num_unified_fields: int = 0,
+    max_spans_per_field: int = 4,
     distributed: bool = False,
 ) -> torch.utils.data.DataLoader:
     """Create a DataLoader for TRM training.
@@ -124,13 +142,19 @@ def create_dataloader(
         num_workers: Number of data loading workers
         collator: Custom collator (optional)
         pad_token_id: Padding token ID
+        num_unified_fields: Number of unified fields (slots + tool_params)
+        max_spans_per_field: Maximum spans per field
         distributed: Whether to use DistributedSampler for DDP
 
     Returns:
         DataLoader instance
     """
     if collator is None:
-        collator = TRMCollator(pad_token_id=pad_token_id)
+        collator = TRMCollator(
+            pad_token_id=pad_token_id,
+            num_unified_fields=num_unified_fields,
+            max_spans_per_field=max_spans_per_field,
+        )
 
     sampler = None
     if distributed:

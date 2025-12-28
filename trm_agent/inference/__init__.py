@@ -1,10 +1,17 @@
 """TRM Inference utilities."""
 
-from .span_decoder import SpanDecoder, decode_spans, extract_slot_values, extract_tool_arguments
+from .span_decoder import (
+    SpanDecoder,
+    DecodedSpan,
+    ToolArguments,
+    decode_spans,
+    extract_unified_fields,
+)
 
 __all__ = [
     "SpanDecoder",
+    "DecodedSpan",
+    "ToolArguments",
     "decode_spans",
-    "extract_slot_values",
-    "extract_tool_arguments",
+    "extract_unified_fields",
 ]
