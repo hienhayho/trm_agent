@@ -2,6 +2,7 @@
 Chainlit Chat Application for TRM Agent.
 
 A chat interface that uses TRM model for decision making and tool calling,
+GLiNER2 for entity extraction (slots and tool arguments),
 with OpenAI for content generation.
 
 Usage:
@@ -11,8 +12,27 @@ Usage:
     # Run the app:
     uv run chainlit run app.py
 
-    # With custom model checkpoint:
+    # With custom TRM model checkpoint:
     TRM_CHECKPOINT=outputs/checkpoint.pt uv run chainlit run app.py
+
+    # With custom GLiNER2 LoRA adapter (after fine-tuning):
+    GLINER2_ADAPTER=outputs/gliner2/final uv run chainlit run app.py
+
+    # With both custom models:
+    TRM_CHECKPOINT=outputs/checkpoint.pt \\
+    GLINER2_ADAPTER=outputs/gliner2/final \\
+    uv run chainlit run app.py
+
+Environment Variables:
+    TRM_CHECKPOINT: Path to TRM model checkpoint
+    TRM_TOKENIZER: Path to TRM tokenizer
+    TRM_TOOLS: Path to tools.json
+    GLINER2_MODEL: Base GLiNER2 model (default: fastino/gliner2-multi-v1)
+    GLINER2_ADAPTER: Path to LoRA adapter directory (optional)
+    GLINER2_THRESHOLD: Entity extraction threshold (default: 0.5)
+    OPENAI_BASE_URL: OpenAI API base URL
+    OPENAI_API_KEY: OpenAI API key
+    OPENAI_MODEL: OpenAI model name
 """
 
 import json
@@ -25,6 +45,7 @@ import torch
 from openai import OpenAI
 
 from trm_agent.data import TRMTokenizer
+from trm_agent.inference import GLiNER2Extractor
 from trm_agent.models import TRMConfig, TRMForToolCalling
 
 # Configuration
@@ -34,6 +55,11 @@ TOOLS_PATH = os.environ.get("TRM_TOOLS", "data/tools.json")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "dummy-key")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "openai/gpt-oss-20b")
+
+# GLiNER2 Configuration
+GLINER2_MODEL = os.environ.get("GLINER2_MODEL", "fastino/gliner2-multi-v1")
+GLINER2_ADAPTER = os.environ.get("GLINER2_ADAPTER", "")  # Path to LoRA adapter
+GLINER2_THRESHOLD = float(os.environ.get("GLINER2_THRESHOLD", "0.5"))
 
 SYSTEM_PROMPT = """Bạn là chuyên viên ảo của FPT Telecom – có 3 vai trò chính:
 1. **Tư vấn bán hàng**: Chuyên tư vấn về Internet Cáp quang, Truyền hình FPT Play, Camera an ninh.
@@ -135,11 +161,14 @@ config: Optional[TRMConfig] = None
 tools: list[dict] = []
 tool_name_to_id: dict[str, int] = {}
 openai_client: Optional[OpenAI] = None
+gliner2_extractor: Optional[GLiNER2Extractor] = None
+tool_param_mapping: dict[str, list[str]] = {}
 
 
 def load_model():
-    """Load TRM model and tokenizer."""
+    """Load TRM model, tokenizer, and GLiNER2 extractor."""
     global model, tokenizer, config, tools, tool_name_to_id, openai_client
+    global gliner2_extractor, tool_param_mapping
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -188,6 +217,33 @@ def load_model():
         api_key=OPENAI_API_KEY,
     )
     print(f"OpenAI client initialized with base_url: {OPENAI_BASE_URL}")
+
+    # Build tool -> params mapping from tools
+    tool_param_mapping = {}
+    for tool in tools:
+        if "function" in tool:
+            func = tool["function"]
+            name = func["name"]
+            params = func.get("parameters", {}).get("properties", {})
+            tool_param_mapping[name] = list(params.keys())
+    print(f"Tool params mapping: {tool_param_mapping}")
+
+    # Initialize GLiNER2 extractor
+    slot_fields = (
+        config.slot_fields
+        if config and hasattr(config, "slot_fields")
+        else ["address", "phone", "device_number", "intent_of_user", "name", "contract_id"]
+    )
+    adapter_path = GLINER2_ADAPTER if GLINER2_ADAPTER else None
+    gliner2_extractor = GLiNER2Extractor(
+        model_name=GLINER2_MODEL,
+        adapter_path=adapter_path,
+        threshold=GLINER2_THRESHOLD,
+        slot_fields=slot_fields,
+    )
+    print(f"GLiNER2 loaded: {GLINER2_MODEL}")
+    if adapter_path:
+        print(f"GLiNER2 adapter loaded: {adapter_path}")
 
 
 # ============================================================================
@@ -270,17 +326,39 @@ def execute_tool(tool_name: str, arguments: dict) -> dict:
 # ============================================================================
 
 
-def predict_with_trm(history: list[dict]) -> tuple[str, Optional[str], dict]:
-    """Use TRM model to predict decision and tool.
+def predict_with_trm(history: list[dict]) -> tuple[str, Optional[str], dict, dict]:
+    """Use TRM model to predict decision and tool, GLiNER2 for entity extraction.
 
     Returns:
-        Tuple of (decision, tool_name, tool_args)
+        Tuple of (decision, tool_name, tool_args, slots)
     """
     global model, tokenizer, config, tool_name_to_id
+    global gliner2_extractor, tool_param_mapping
+
+    # Build full text from conversation history for GLiNER2
+    full_text = ""
+    for msg in history:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            full_text += f"{role}: {content}\n"
+        elif isinstance(content, dict):
+            full_text += f"{role}: {json.dumps(content, ensure_ascii=False)}\n"
 
     if model is None or tokenizer is None:
-        # Mock mode - default to direct_answer
-        return "direct_answer", None, {}
+        # Mock mode - use GLiNER2 only for extraction
+        decision = "direct_answer"
+        tool_name = None
+        slots, tool_args = {}, {}
+
+        if gliner2_extractor:
+            slots, tool_args = gliner2_extractor.extract_all(
+                text=full_text,
+                tool_name=None,
+                tool_params=tool_param_mapping,
+            )
+
+        return decision, tool_name, tool_args, slots
 
     device = next(model.parameters()).device
     id_to_name = {v: k for k, v in tool_name_to_id.items()}
@@ -296,7 +374,7 @@ def predict_with_trm(history: list[dict]) -> tuple[str, Optional[str], dict]:
     )
     role_ids = torch.tensor([encoded["role_ids"]], dtype=torch.long, device=device)
 
-    # Run inference
+    # Run TRM inference (decision + tool selection only)
     with torch.no_grad():
         outputs = model.inference(
             input_ids=input_ids,
@@ -304,50 +382,28 @@ def predict_with_trm(history: list[dict]) -> tuple[str, Optional[str], dict]:
             role_ids=role_ids,
         )
 
-    # Get decision
+    # Get decision from TRM
     decision_prob = torch.sigmoid(outputs.decision_logits[0]).item()
     decision = "tool_call" if decision_prob > 0.5 else "direct_answer"
 
     tool_name = None
     tool_args = {}
+    slots = {}
 
     if decision == "tool_call":
-        # Get tool name
+        # Get tool name from TRM
         tool_idx = outputs.tool_logits[0].argmax().item()
         tool_name = id_to_name.get(tool_idx, f"tool_{tool_idx}")
 
-        # Extract tool arguments from spans
-        token_offsets = encoded["offsets"]
-        full_text = encoded["full_text"]
+    # Use GLiNER2 for entity extraction (both slots and tool args)
+    if gliner2_extractor:
+        slots, tool_args = gliner2_extractor.extract_all(
+            text=full_text,
+            tool_name=tool_name if decision == "tool_call" else None,
+            tool_params=tool_param_mapping,
+        )
 
-        # Get param fields from config
-        unified_fields = config.get_unified_fields()
-        num_slots = config.num_slots
-
-        # Only extract tool params (not slots)
-        for param_idx in range(config.num_tool_params):
-            unified_idx = num_slots + param_idx
-            param_name = (
-                unified_fields[unified_idx]
-                if unified_idx < len(unified_fields)
-                else None
-            )
-
-            if param_name:
-                start_pos = (
-                    outputs.param_start_logits[0, :, unified_idx].argmax().item()
-                )
-                end_pos = outputs.param_end_logits[0, :, unified_idx].argmax().item()
-
-                if start_pos < len(token_offsets) and end_pos < len(token_offsets):
-                    char_start = token_offsets[start_pos][0]
-                    char_end = token_offsets[end_pos][1]
-                    if char_start >= 0 and char_end > char_start:
-                        arg_value = full_text[char_start:char_end].strip()
-                        if arg_value:
-                            tool_args[param_name] = arg_value
-
-    return decision, tool_name, tool_args
+    return decision, tool_name, tool_args, slots
 
 
 async def generate_response(history: list[dict]) -> str:
@@ -419,15 +475,17 @@ async def on_message(message: cl.Message):
     # Add user message to history
     history.append({"role": "user", "content": message.content})
 
-    # Get TRM prediction
-    decision, tool_name, tool_args = predict_with_trm(history)
+    # Get TRM + GLiNER2 prediction
+    decision, tool_name, tool_args, slots = predict_with_trm(history)
 
-    # Show TRM prediction in UI
-    trm_info = f"🤖 **TRM Prediction**\n- Decision: `{decision}`"
+    # Show TRM + GLiNER2 prediction in UI
+    trm_info = f"🤖 **TRM + GLiNER2 Prediction**\n- Decision: `{decision}`"
     if decision == "tool_call" and tool_name:
         trm_info += f"\n- Tool: `{tool_name}`"
         if tool_args:
             trm_info += f"\n- Args: `{json.dumps(tool_args, ensure_ascii=False)}`"
+    if slots:
+        trm_info += f"\n- Slots: `{json.dumps(slots, ensure_ascii=False)}`"
     await cl.Message(content=trm_info).send()
 
     if decision == "tool_call" and tool_name:

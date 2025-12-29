@@ -1,0 +1,57 @@
+# GLiNER2 LoRA Training Configuration - Production
+# Usage: uv run python tools/train_gliner2.py --config configs/gliner2_train_production.yaml
+
+# Data paths
+train_data:
+  - data/train.jsonl
+val_data:
+  - data/test.jsonl
+# val_split: 0.1  # Alternative: split validation from training data (per-file)
+output_dir: outputs/gliner2_production
+
+# Model
+base_model: fastino/gliner2-multi-v1
+
+# Training
+num_epochs: 5
+batch_size: 1
+gradient_accumulation_steps: 4
+
+# Learning rates
+encoder_lr: 1e-5  # Ignored when LoRA enabled
+task_lr: 1e-4
+
+# Optimization
+weight_decay: 0.01
+max_grad_norm: 1.0
+scheduler_type: cosine
+warmup_ratio: 0.1
+
+# Mixed precision
+fp16: true
+
+# Checkpointing & Evaluation
+eval_strategy: epoch
+save_best: true
+save_total_limit: 5
+
+# Early stopping
+early_stopping: true
+early_stopping_patience: 5
+
+# Logging
+logging_steps: 50
+
+# LoRA settings - High performance
+use_lora: true
+lora_r: 32              # Higher rank for better performance
+lora_alpha: 64          # 2 * r
+lora_dropout: 0.05
+lora_target_modules:    # Encoder + task heads for better performance
+  - encoder
+  - span_rep
+  - classifier
+save_adapter_only: true
+
+# Other
+seed: 42

@@ -1,5 +1,6 @@
 """TRM Inference utilities."""
 
+from .gliner2_extractor import GLiNER2Extractor
 from .span_decoder import (
     SpanDecoder,
     DecodedSpan,
@@ -9,6 +10,7 @@ from .span_decoder import (
 )
 
 __all__ = [
+    "GLiNER2Extractor",
     "SpanDecoder",
     "DecodedSpan",
     "ToolArguments",

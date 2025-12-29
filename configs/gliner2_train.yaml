@@ -1,0 +1,55 @@
+# GLiNER2 LoRA Training Configuration
+# Usage: uv run python tools/train_gliner2.py --config configs/gliner2_train.yaml
+
+# Data paths (can be overridden via CLI)
+train_data:
+  - data/train.jsonl
+val_data:
+  - data/test.jsonl
+# val_split: 0.1  # Alternative: split validation from training data (per-file)
+output_dir: outputs/gliner2
+
+# Model
+base_model: fastino/gliner2-multi-v1
+
+# Training
+num_epochs: 10
+batch_size: 16
+gradient_accumulation_steps: 2
+
+# Learning rates
+# Note: encoder_lr is ignored when LoRA is enabled
+# task_lr is used for both LoRA and task-specific heads
+encoder_lr: 1e-5
+task_lr: 5e-4
+
+# Optimization
+weight_decay: 0.01
+max_grad_norm: 1.0
+scheduler_type: linear
+warmup_ratio: 0.1
+
+# Mixed precision
+fp16: true
+
+# Checkpointing & Evaluation
+eval_strategy: epoch  # "epoch", "steps", or "no"
+save_best: true
+save_total_limit: 3
+
+# Logging
+logging_steps: 50
+
+# LoRA settings
+use_lora: true
+lora_r: 16              # Rank (4, 8, 16, 32, 64) - higher = more params
+lora_alpha: 32          # Scaling factor (typically 2*r)
+lora_dropout: 0.1       # Dropout for regularization
+lora_target_modules:    # Which modules to apply LoRA to (all for best performance)
+  - encoder             # All encoder layers (query, key, value, dense)
+  - span_rep            # Span representation module
+  - classifier          # Classifier head
+save_adapter_only: true # Save only adapter weights (~2-10 MB)
+
+# Other
+seed: 42
