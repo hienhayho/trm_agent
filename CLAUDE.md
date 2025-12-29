@@ -261,3 +261,4 @@ uv run python tools/convert_raw_to_dataset.py tests/sample_data tests/output.jso
 - Don't add: #!/usr/bin/env python3 at the begining of python script files.
 - Example usage must be used with: uv run ...
 - When implemented or modified something, always check docs folder to if need to update any document or not.
+- use builtin logger of trm-agent for logging in DDP environment.
