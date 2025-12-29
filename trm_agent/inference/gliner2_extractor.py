@@ -237,13 +237,8 @@ class GLiNER2Extractor:
                 if arg not in labels:
                     labels.append(arg)
 
-        # Debug
-        print(f"[DEBUG extract_all] tool_name={tool_name}, tool_arg_labels={tool_arg_labels}")
-        print(f"[DEBUG extract_all] labels={labels}")
-
         # Single extraction call
         entities = self.extract(text, labels)
-        print(f"[DEBUG extract_all] entities={entities}")
 
         # Split results into slots and tool args
         slots: dict[str, str] = {}

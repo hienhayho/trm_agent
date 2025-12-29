@@ -475,22 +475,51 @@ async def on_message(message: cl.Message):
     # Add user message to history
     history.append({"role": "user", "content": message.content})
 
-    # Get TRM + GLiNER2 prediction
-    decision, tool_name, tool_args, slots = predict_with_trm(history)
+    # Build full text for GLiNER2
+    full_text = ""
+    for msg in history:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            full_text += f"{role}: {content}\n"
+        elif isinstance(content, dict):
+            full_text += f"{role}: {json.dumps(content, ensure_ascii=False)}\n"
 
-    # Show TRM + GLiNER2 prediction in UI
-    trm_info = f"🤖 **TRM + GLiNER2 Prediction**\n- Decision: `{decision}`"
-    if decision == "tool_call" and tool_name:
-        trm_info += f"\n- Tool: `{tool_name}`"
-        if tool_args:
-            trm_info += f"\n- Args: `{json.dumps(tool_args, ensure_ascii=False)}`"
-    if slots:
-        trm_info += f"\n- Slots: `{json.dumps(slots, ensure_ascii=False)}`"
-    await cl.Message(content=trm_info).send()
+    # Step 1: TRM Prediction
+    async with cl.Step(name="TRM Prediction", type="tool") as trm_step:
+        decision, tool_name, tool_args, slots = predict_with_trm(history)
+        trm_step.input = "Analyzing conversation history..."
+        trm_output = {
+            "decision": decision,
+            "tool": tool_name if tool_name else None,
+        }
+        trm_step.output = json.dumps(trm_output, ensure_ascii=False, indent=2)
+
+    # Step 2: GLiNER2 Entity Extraction
+    async with cl.Step(name="GLiNER2 Extraction", type="tool") as gliner_step:
+        # Show what labels we're extracting
+        labels = list(gliner2_extractor.slot_fields) if gliner2_extractor else []
+        if tool_name and tool_name in tool_param_mapping:
+            for arg in tool_param_mapping[tool_name]:
+                if arg not in labels:
+                    labels.append(arg)
+
+        gliner_step.input = json.dumps({
+            "text": full_text[-500:] + "..." if len(full_text) > 500 else full_text,
+            "labels": labels,
+        }, ensure_ascii=False, indent=2)
+
+        gliner_step.output = json.dumps({
+            "slots": slots,
+            "tool_args": tool_args,
+        }, ensure_ascii=False, indent=2)
 
     if decision == "tool_call" and tool_name:
-        # Execute tool
-        tool_result = execute_tool(tool_name, tool_args)
+        # Step 3: Tool Execution
+        async with cl.Step(name=f"Tool: {tool_name}", type="tool") as tool_step:
+            tool_step.input = json.dumps(tool_args, ensure_ascii=False, indent=2)
+            tool_result = execute_tool(tool_name, tool_args)
+            tool_step.output = json.dumps(tool_result, ensure_ascii=False, indent=2)
 
         # Add tool call and response to history
         history.append(
@@ -500,12 +529,6 @@ async def on_message(message: cl.Message):
             }
         )
         history.append({"role": "tool_response", "content": tool_result})
-
-        # Show tool execution to user
-        tool_msg = cl.Message(
-            content=f"🔧 **Đang gọi công cụ**: `{tool_name}`\n**Tham số**: `{json.dumps(tool_args, ensure_ascii=False)}`",
-        )
-        await tool_msg.send()
 
         # Generate response based on tool result
         response = await generate_response(history)
