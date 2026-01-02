@@ -2,22 +2,23 @@
 
 This document describes the loss functions used for training the TRM model.
 
+> **Note:** Span extraction (slots/params) is handled by **GLiNER2**, not TRM. TRM only handles decision classification and tool selection.
+
 ## Overview
 
-TRM training uses multiple loss functions combined into a weighted sum:
+TRM training uses loss functions combined into a weighted sum:
 
 ```
-Total Loss = w_d * L_decision + w_t * L_tool + w_s * L_slot + w_q * L_q + w_ss * L_slot_span + w_as * L_arg_span
+Total Loss = w_d * L_decision + w_t * L_tool + w_q * L_q
 ```
 
 | Loss | Weight | Description |
 |------|--------|-------------|
 | `L_decision` | 1.0 | Decision classification (Focal Loss) |
 | `L_tool` | 1.0 | Tool name prediction (Cross Entropy) |
-| `L_slot` | 0.5 | Slot presence prediction (BCE) |
 | `L_q` | 0.5 | Halting probability (BCE) |
-| `L_slot_span` | 0.5 | Slot value span extraction (Cross Entropy) |
-| `L_arg_span` | 0.5 | Tool argument span extraction (Cross Entropy) |
+
+> **Note:** Slot/arg span extraction losses are no longer used in TRM. See GLiNER2 documentation for entity extraction.
 
 ## Loss Components
 
@@ -147,39 +148,11 @@ tool_name_labels = [
 ]
 ```
 
-### 3. Slot Loss (BCE)
+### 3. Slot Loss (Deprecated)
 
-Binary classification for each slot's presence.
+> **Deprecated:** Slot extraction is now handled by **GLiNER2**, not TRM. This section is kept for historical reference.
 
-#### Formula
-
-```
-L_slot = BCEWithLogits(slot_presence_logits, slot_presence_labels)
-```
-
-#### Label Format
-
-```python
-slot_presence_labels = [
-    [1, 1, 0, 0, 1, 0],  # Sample 0: slots 0,1,4 are filled
-    [0, 1, 0, 0, 0, 1],  # Sample 1: slots 1,5 are filled
-    ...
-]
-# Shape: [batch_size, num_slots]
-```
-
-#### Slot Fields
-
-Default slots tracked:
-
-| Index | Field |
-|-------|-------|
-| 0 | address |
-| 1 | phone |
-| 2 | device_number |
-| 3 | intent_of_user |
-| 4 | name |
-| 5 | contract_id |
+Binary classification for each slot's presence (no longer used in TRM training).
 
 ### 4. Q Loss (BCE)
 
@@ -227,10 +200,9 @@ class TRMLoss(nn.Module):
         self.decision_loss = FocalLoss(alpha=config.focal_alpha,
                                         gamma=config.focal_gamma)
         self.tool_loss = nn.CrossEntropyLoss(ignore_index=-1)
-        self.slot_loss = nn.BCEWithLogitsLoss()
         self.q_loss = nn.BCEWithLogitsLoss()
 
-    def forward(self, outputs, decision_labels, tool_name_labels, slot_presence_labels):
+    def forward(self, outputs, decision_labels, tool_name_labels):
         losses = {}
 
         # 1. Decision loss
@@ -245,19 +217,14 @@ class TRMLoss(nn.Module):
         else:
             losses["tool_loss"] = 0.0
 
-        # 3. Slot loss
-        losses["slot_loss"] = self.slot_loss(outputs.slot_presence_logits,
-                                              slot_presence_labels)
-
-        # 4. Q loss
+        # 3. Q loss
         is_correct = compute_correctness(outputs, decision_labels)
         losses["q_loss"] = self.q_loss(outputs.q_logits, is_correct)
 
-        # 5. Total
+        # 4. Total
         losses["total_loss"] = (
             w_d * losses["decision_loss"] +
             w_t * losses["tool_loss"] +
-            w_s * losses["slot_loss"] +
             w_q * losses["q_loss"]
         )
 
@@ -270,7 +237,6 @@ class TRMLoss(nn.Module):
 losses = {
     "decision_loss": 0.234,   # Focal loss value
     "tool_loss": 1.456,       # Cross entropy value
-    "slot_loss": 0.123,       # BCE value
     "q_loss": 0.567,          # BCE value
     "total_loss": 1.892,      # Weighted sum
 }
@@ -280,19 +246,20 @@ losses = {
 
 Aggregates loss over all N_sup supervision steps.
 
+> **Note:** With TBPTL enabled, only `N_sup - tbptl_no_grad_steps` outputs are collected for loss computation.
+
 ### Algorithm
 
 ```python
 class DeepSupervisionLoss(nn.Module):
-    def forward(self, all_outputs, decision_labels, tool_labels, slot_labels):
+    def forward(self, all_outputs, decision_labels, tool_labels):
         total_losses = {"decision_loss": 0, "tool_loss": 0,
-                        "slot_loss": 0, "q_loss": 0, "total_loss": 0}
+                        "q_loss": 0, "total_loss": 0}
 
-        num_steps = len(all_outputs)  # N_sup = 16
+        num_steps = len(all_outputs)  # N_sup - tbptl_no_grad_steps
 
         for outputs in all_outputs:
-            step_losses = self.step_loss(outputs, decision_labels,
-                                          tool_labels, slot_labels)
+            step_losses = self.step_loss(outputs, decision_labels, tool_labels)
             for key in total_losses:
                 total_losses[key] += step_losses[key]
 
@@ -333,10 +300,7 @@ Step 1    Step 2    Step 3    ...    Step N_sup
 # In config
 decision_loss_weight: 1.0
 tool_loss_weight: 1.0
-slots_loss_weight: 0.5
 q_loss_weight: 0.5
-slot_span_loss_weight: 0.5
-arg_span_loss_weight: 0.5
 
 focal_alpha: 0.25
 focal_gamma: 2.0
@@ -348,9 +312,6 @@ focal_gamma: 2.0
 config = TRMConfig(
     # Increase decision importance
     decision_loss_weight=2.0,
-
-    # Decrease slot importance
-    slots_loss_weight=0.25,
 
     # Adjust focal loss for different imbalance
     focal_alpha=0.5,   # Equal weight for both classes
@@ -369,19 +330,18 @@ loss_fn = DeepSupervisionLoss(config)
 
 # Training loop
 for batch in dataloader:
-    # Forward pass with deep supervision
+    # Forward pass with deep supervision (TBPTL: first K steps no gradients)
     all_outputs = model.train_step(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
         role_ids=batch["role_ids"],
     )
 
-    # Compute loss over all supervision steps
+    # Compute loss over collected supervision steps
     losses = loss_fn(
         all_outputs,
         batch["decision_labels"],
         batch["tool_name_labels"],
-        batch["slot_presence_labels"],
     )
 
     # Backward pass
@@ -390,99 +350,26 @@ for batch in dataloader:
     # Log individual losses
     print(f"Decision: {losses['decision_loss']:.4f}")
     print(f"Tool: {losses['tool_loss']:.4f}")
-    print(f"Slot: {losses['slot_loss']:.4f}")
     print(f"Q: {losses['q_loss']:.4f}")
     print(f"Total: {losses['total_loss']:.4f}")
 ```
 
-### 5. Span Extraction Loss
+### 5. Span Extraction Loss (Deprecated)
 
-Extracts values from input context by predicting start/end token positions.
+> **Deprecated:** Span extraction is now handled by **GLiNER2**, not TRM. This section is kept for historical reference.
 
-#### Purpose
-
-Instead of generating text, span extraction locates values in the input:
-- Slot values (e.g., phone number, address mentioned in conversation)
-- Tool argument values (e.g., query mentioned by user)
-
-#### Formula
-
-```
-L_span = (L_start + L_end) / 2
-
-where:
-L_start = CrossEntropy(start_logits, start_labels)
-L_end = CrossEntropy(end_logits, end_labels)
-```
-
-#### Label Format
-
-Labels are token positions (0 to seq_len-1), or -1 if not found:
-
-```python
-# Slot span labels
-slot_start_labels = [42, -1, 15, 28, -1, 7]   # [num_slots]
-slot_end_labels = [45, -1, 18, 32, -1, 12]    # [num_slots]
-
-# Argument span labels
-arg_start_labels = [42, 67, -1, -1, ...]      # [max_tool_args]
-arg_end_labels = [45, 72, -1, -1, ...]        # [max_tool_args]
-```
-
-#### Implementation
-
-```python
-class SpanExtractionLoss(nn.Module):
-    def __init__(self, ignore_index=-1):
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index)
-
-    def forward(self, start_logits, end_logits, start_labels, end_labels):
-        batch_size, seq_len, num_spans = start_logits.shape
-
-        # Transpose: [batch, seq_len, num_spans] → [batch, num_spans, seq_len]
-        start_logits = start_logits.transpose(1, 2)
-        end_logits = end_logits.transpose(1, 2)
-
-        # Reshape for cross entropy: [batch * num_spans, seq_len]
-        start_logits = start_logits.reshape(-1, seq_len)
-        end_logits = end_logits.reshape(-1, seq_len)
-
-        # Flatten labels: [batch * num_spans]
-        start_labels = start_labels.view(-1)
-        end_labels = end_labels.view(-1)
-
-        # Compute losses (ignore_index=-1 handles missing spans)
-        start_loss = self.ce_loss(start_logits, start_labels)
-        end_loss = self.ce_loss(end_logits, end_labels)
-
-        return (start_loss + end_loss) / 2
-```
-
-#### Handling Missing Spans
-
-When a value cannot be found in the input context:
-- Labels set to -1
-- CrossEntropyLoss ignores these with `ignore_index=-1`
-- No gradient contribution for unfindable values
-
-#### Slot vs Argument Spans
-
-| Type | Shape | When Computed |
-|------|-------|---------------|
-| Slot spans | `[batch, num_slots]` | Always (all samples) |
-| Arg spans | `[batch, max_args]` | Only for `tool_call` samples |
+Span extraction was previously used to locate values in the input context by predicting start/end token positions. This has been replaced by GLiNER2 for more accurate entity extraction.
 
 ## Training Phases
 
 ### Current Training
 
-Full loss with span extraction:
-- Decision loss (Focal)
-- Tool loss (only for tool_call)
-- Slot presence loss
-- Q loss (halting)
-- **Slot span extraction loss** (extracting slot values)
-- **Argument span extraction loss** (extracting tool arguments)
+TRM training uses:
+- **Decision loss** (Focal) - classify tool_call vs direct_answer
+- **Tool loss** (Cross Entropy) - predict tool name for tool_call samples
+- **Q loss** (BCE) - halting probability
+
+> **Note:** Slot presence and span extraction losses have been removed. Use GLiNER2 for entity extraction.
 
 ### Future Phase
 
@@ -502,10 +389,7 @@ content_loss = CrossEntropyLoss(content_logits, content_labels)
 |--------|-------------------|
 | `decision_loss` | Decreases steadily |
 | `tool_loss` | Decreases (may fluctuate if few tool_call samples) |
-| `slot_loss` | Decreases |
 | `q_loss` | Starts high, decreases as model improves |
-| `slot_span_loss` | Decreases as model learns to locate values |
-| `arg_span_loss` | Decreases (only computed for tool_call samples) |
 | `total_loss` | Overall decreasing trend |
 
 ### Warning Signs
@@ -515,6 +399,4 @@ content_loss = CrossEntropyLoss(content_logits, content_labels)
 | `decision_loss` not decreasing | Learning rate too low, or severe imbalance |
 | `tool_loss` = 0 always | No tool_call samples in batch |
 | `q_loss` stuck at ~0.69 | Model predicting random (log(2) ≈ 0.69) |
-| `slot_span_loss` not decreasing | Values not in context, or offset mapping issues |
-| `arg_span_loss` not decreasing | Few tool_call samples, or value not in context |
 | Loss exploding | Learning rate too high, gradient issues |

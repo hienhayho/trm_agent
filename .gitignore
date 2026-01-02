@@ -18,5 +18,8 @@ checkpoints/
 data/*.jsonl
 data/*.json
 !data/tools.json
+data/*.txt
+!data/system_prompts.txt
 data_sale.json
 .chainlit
+thirdparties/

@@ -13,7 +13,7 @@ output_dir: outputs/gliner2_production
 base_model: fastino/gliner2-multi-v1
 
 # Training
-num_epochs: 5
+num_epochs: 3
 batch_size: 1
 gradient_accumulation_steps: 4
 
@@ -44,8 +44,8 @@ logging_steps: 50
 
 # LoRA settings - High performance
 use_lora: true
-lora_r: 32              # Higher rank for better performance
-lora_alpha: 64          # 2 * r
+lora_r: 16              # Higher rank for better performance
+lora_alpha: 32          # 2 * r
 lora_dropout: 0.05
 lora_target_modules:    # Encoder + task heads for better performance
   - encoder

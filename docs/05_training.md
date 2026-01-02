@@ -2,6 +2,8 @@
 
 This document describes the TRM training process, including all components from data loading to optimization.
 
+> **Note:** Span extraction (slots/params) is handled by **GLiNER2**, not TRM. TRM only handles decision classification and tool selection.
+
 ## Overview
 
 ```
@@ -17,6 +19,7 @@ This document describes the TRM training process, including all components from 
 │  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐                   │
 │  │    Model    │────►│    Loss     │────►│  Backward   │                   │
 │  │ (N_sup steps)│     │(Deep Super) │     │             │                   │
+│  │ + TBPTL     │     │             │     │             │                   │
 │  └─────────────┘     └─────────────┘     └──────┬──────┘                   │
 │                                                  │                          │
 │                                                  ▼                          │
@@ -152,6 +155,81 @@ evaluate(model)
 ema.restore()
 ```
 
+### 5. URM Innovations
+
+TRM incorporates key optimizations from the Universal Reasoning Model (URM) paper.
+
+#### ConvSwiGLU (+5-8% accuracy)
+
+Adds depthwise 1D convolution to the SwiGLU MLP for local feature mixing:
+
+```python
+class ConvSwiGLU(nn.Module):
+    """SwiGLU with depthwise short convolution."""
+    def __init__(self, hidden_size, intermediate_size, kernel_size=2):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        # Depthwise convolution for local feature mixing
+        self.dwconv = nn.Conv1d(
+            intermediate_size, intermediate_size,
+            kernel_size=kernel_size,
+            padding=kernel_size - 1,
+            groups=intermediate_size,
+            bias=False,
+        )
+
+    def forward(self, x):
+        gate = F.silu(self.gate_proj(x))
+        up = self.up_proj(x)
+        hidden = gate * up
+        # Conv1d: (B, T, C) -> (B, C, T) -> conv -> (B, T, C)
+        hidden = self.dwconv(hidden.transpose(1, 2))[:, :, :x.size(1)].transpose(1, 2)
+        hidden = F.silu(hidden)
+        return self.down_proj(hidden)
+```
+
+**Configuration:**
+```python
+use_conv_swiglu: bool = True   # Enable ConvSwiGLU (default: True)
+conv_kernel_size: int = 2      # Short conv kernel size
+```
+
+**Trade-off:** ConvSwiGLU uses more memory. Disable with `--no-conv-swiglu` if OOM occurs.
+
+#### TBPTL - Truncated Backprop Through Loops (-12% memory, +2-3% accuracy)
+
+Skips loss computation on the first K supervision steps, reducing memory while improving convergence:
+
+```
+                    N_sup = 16 Supervision Steps
+┌─────────────────────────────────────────────────────────────┐
+│                                                             │
+│  Step 0   Step 1   Step 2   Step 3   ...   Step 15         │
+│    ↓        ↓        ↓        ↓              ↓              │
+│  no_grad  no_grad  collect  collect  ...   collect         │
+│  (skip)   (skip)   (loss)   (loss)          (loss)         │
+│                                                             │
+│  ←── tbptl_no_grad_steps = 2 ──→                           │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Configuration:**
+```python
+tbptl_no_grad_steps: int = 2   # Skip loss on first N steps (default: 2)
+                               # Set to 0 to disable TBPTL
+```
+
+**Expected Impact (from URM paper):**
+
+| Feature | Memory | Speed | Accuracy Gain |
+|---------|--------|-------|---------------|
+| ConvSwiGLU | +~20% | -2% | **+5-8%** |
+| TBPTL (2 steps) | -12% | +5% | **+2-3%** |
+| **Combined** | +8% | +3% | **+7-10%** |
+
 ## Training Loop
 
 ### Single Training Step
@@ -164,18 +242,18 @@ def train_step(batch):
     batch = {k: v.to(device) for k, v in batch.items()}
 
     # 2. Forward pass (N_sup supervision steps)
+    # Note: TBPTL skips first K steps (no_grad), reducing memory
     all_outputs = model.train_step(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
         role_ids=batch["role_ids"],
     )
 
-    # 3. Compute loss over all steps
+    # 3. Compute loss over collected steps (after TBPTL skip)
     losses = loss_fn(
         all_outputs,
         batch["decision_labels"],
         batch["tool_name_labels"],
-        batch["slot_presence_labels"],
     )
 
     # 4. Backward pass
@@ -184,6 +262,8 @@ def train_step(batch):
 
     return losses
 ```
+
+> **Note:** Slot/parameter extraction is handled by GLiNER2, not TRM. TRM only predicts `decision` (tool_call vs direct_answer) and `tool_name`.
 
 ### Epoch Loop
 
@@ -255,13 +335,14 @@ def evaluate():
     for batch in eval_dataloader:
         outputs = model.inference(...)
 
-        # Decision confusion matrix
-        # Tool name accuracy (for tool_call samples)
-        # Slot presence accuracy (per-slot and overall)
+        # Decision confusion matrix (tool_call vs direct_answer)
+        # Tool name accuracy (for tool_call samples only)
 
     ema.restore()
     return metrics
 ```
+
+> **Note:** Slot/parameter extraction metrics are evaluated separately using GLiNER2.
 
 ### Confusion Matrix Display (Rich Table)
 
@@ -288,21 +369,7 @@ def evaluate():
 │ Decision F1            │         0.9477 │
 │                        │                │
 │ Tool Accuracy          │ 0.8980 (245 s) │
-│                        │                │
-│ Slot Accuracy (Overall)│         0.8756 │
 └────────────────────────┴────────────────┘
-
-        Per-Slot Accuracy
-┏━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┓
-┃ Slot Field      ┃ Accuracy ┃
-┡━━━━━━━━━━━━━━━━━╇━━━━━━━━━━┩
-│ address         │   0.9200 │  (green: >= 0.9)
-│ phone           │   0.8500 │  (yellow: >= 0.7)
-│ device_number   │   0.9100 │  (green: >= 0.9)
-│ intent_of_user  │   0.7800 │  (yellow: >= 0.7)
-│ name            │   0.8900 │  (yellow: >= 0.7)
-│ contract_id     │   0.6500 │  (red: < 0.7)
-└─────────────────┴──────────┘
 ```
 
 ### Metrics Computed
@@ -314,7 +381,6 @@ def evaluate():
 | Decision Recall | TP / (TP + FN) | Of all tool_calls, how many detected |
 | Decision F1 | 2 * P * R / (P + R) | Harmonic mean of precision and recall |
 | Tool Accuracy | Correct / Total | Tool name classification accuracy |
-| Slot Accuracy | Correct slots / Total | Overall slot presence accuracy |
 
 ## Checkpointing
 
@@ -389,6 +455,32 @@ uv run python tools/train.py \
 
 This splits 10% of training data for validation.
 
+### URM Flags
+
+```bash
+# Disable ConvSwiGLU (use standard SwiGLU) - saves memory
+uv run python tools/train.py \
+    --config configs/default.yaml \
+    --train-data data/train.jsonl \
+    --no-conv-swiglu \
+    --output-dir outputs/
+```
+
+### Distributed Training (DDP)
+
+```bash
+# Multi-GPU training with torchrun
+torchrun --nproc_per_node=4 tools/train.py \
+    --config configs/default.yaml \
+    --train-data data/train.jsonl \
+    --output-dir outputs/
+```
+
+**DDP Optimizations:**
+- Gradient sync is skipped during accumulation steps (`model.no_sync()`)
+- Tokenizer training uses file-based sync to avoid NCCL timeout
+- Only rank 0 performs tokenizer training (others wait)
+
 ## Hyperparameter Recommendations
 
 | Parameter | Small Dataset | Large Dataset |
@@ -430,6 +522,8 @@ This example shows one sample flowing through all components.
   "content": ""
 }
 ```
+
+> **Note:** The `slots` field is present in the dataset format but processed by **GLiNER2**, not TRM. TRM only uses `decision` (tool_call vs direct_answer) and `tool` (tool name).
 
 ### Step 2: Tokenization
 
@@ -481,9 +575,10 @@ sample = {
     "role_ids": tensor([0, 1, 1, ..., 0]),             # [45]
     "decision_label": tensor(1.0),                     # scalar (tool_call=1)
     "tool_name_label": tensor(0),                      # scalar (get_customer_info=0)
-    "slot_presence_labels": tensor([0, 1, 0, 0, 1, 0]) # [6] (phone, intent filled)
 }
 ```
+
+> **Note:** Slot extraction is handled by GLiNER2, not the TRM dataset.
 
 ### Step 4: Batch Collation
 
@@ -521,12 +616,6 @@ batch = {
 
     "decision_labels": tensor([1., 0., 1., 0.]),  # [4]
     "tool_name_labels": tensor([0, -1, 2, -1]),   # [4] (-1 = direct_answer)
-    "slot_presence_labels": tensor([
-        [0., 1., 0., 0., 1., 0.],
-        [0., 0., 0., 0., 0., 0.],
-        [1., 1., 0., 0., 1., 0.],
-        [0., 0., 0., 0., 0., 0.],
-    ]),  # Shape: [4, 6]
 }
 ```
 
@@ -539,10 +628,13 @@ config = TRMConfig(
     hidden_size=512,
     num_layers=2,
     num_tools=3,
-    num_slots=6,
     n_latent_recursion=6,
     T_deep_recursion=3,
     N_supervision=16,
+    # URM innovations (enabled by default)
+    use_conv_swiglu=True,
+    conv_kernel_size=2,
+    tbptl_no_grad_steps=2,
 )
 model = TRMForToolCalling(config)
 
@@ -551,7 +643,7 @@ device = torch.device("cuda")
 model = model.to(device)
 batch = {k: v.to(device) for k, v in batch.items()}
 
-# Training forward (returns N_sup outputs)
+# Training forward (returns N_sup - tbptl_no_grad_steps outputs)
 all_outputs = model.train_step(
     input_ids=batch["input_ids"],           # [4, 64]
     attention_mask=batch["attention_mask"], # [4, 64]
@@ -559,24 +651,21 @@ all_outputs = model.train_step(
 )
 ```
 
-**Output (list of 16 TRMOutput):**
+**Output (list of 14 TRMOutput, with TBPTL skipping first 2):**
 
 ```python
-len(all_outputs)  # 16 (N_supervision steps)
+len(all_outputs)  # 14 (N_supervision - tbptl_no_grad_steps)
 
 # Each TRMOutput contains:
 output = all_outputs[0]
 output.decision_logits      # [4, 1]
 output.tool_logits          # [4, 3] (num_tools=3)
-output.arg_start_logits     # [4, 64, 10]
-output.arg_end_logits       # [4, 64, 10]
-output.slot_start_logits    # [4, 64, 6]
-output.slot_end_logits      # [4, 64, 6]
-output.slot_presence_logits # [4, 6]
 output.q_logits             # [4, 1]
 output.y                    # [4, 64, 512]
 output.z                    # [4, 64, 512]
 ```
+
+> **Note:** Span extraction outputs (slot/arg logits) are removed. Use GLiNER2 for entity extraction.
 
 ### Step 6: Loss Computation
 
@@ -586,10 +675,9 @@ from trm_agent.training.losses import DeepSupervisionLoss
 loss_fn = DeepSupervisionLoss(config)
 
 losses = loss_fn(
-    all_outputs,                        # List of 16 TRMOutput
+    all_outputs,                        # List of 14 TRMOutput (after TBPTL)
     batch["decision_labels"],           # [4]
     batch["tool_name_labels"],          # [4]
-    batch["slot_presence_labels"],      # [4, 6]
 )
 ```
 
@@ -599,18 +687,18 @@ losses = loss_fn(
 losses = {
     "decision_loss": tensor(0.4532),  # Focal Loss
     "tool_loss": tensor(1.0234),      # Cross Entropy (masked)
-    "slot_loss": tensor(0.2341),      # BCE
     "q_loss": tensor(0.6789),         # BCE
     "total_loss": tensor(1.8234),     # Weighted sum
 }
 
 # How total_loss is computed:
-# total_loss = 1.0 * decision_loss + 1.0 * tool_loss
-#            + 0.5 * slot_loss + 0.5 * q_loss
-# = 1.0 * 0.4532 + 1.0 * 1.0234 + 0.5 * 0.2341 + 0.5 * 0.6789
-# = 0.4532 + 1.0234 + 0.1171 + 0.3395
-# = 1.9332 (approximately)
+# total_loss = 1.0 * decision_loss + 1.0 * tool_loss + 0.5 * q_loss
+# = 1.0 * 0.4532 + 1.0 * 1.0234 + 0.5 * 0.6789
+# = 0.4532 + 1.0234 + 0.3395
+# = 1.8161 (approximately)
 ```
+
+> **Note:** Slot loss is removed since span extraction is handled by GLiNER2.
 
 ### Step 7: Backward and Optimization
 
@@ -652,13 +740,12 @@ with torch.no_grad():
     tool_ids = output.tool_logits.argmax(dim=-1)
     # tensor([0, 1, 2, 0])  # Predicted tool IDs
 
-    slot_presence = torch.sigmoid(output.slot_presence_logits) > 0.5
-    # tensor([[F, T, F, F, T, F],
-    #         [F, F, F, F, F, F],
-    #         [T, T, F, F, T, F],
-    #         [F, F, F, F, F, F]])
-
     ema.restore()  # Restore original weights
+
+# For slot/parameter extraction, use GLiNER2 separately
+# from gliner import GLiNER
+# gliner = GLiNER.from_pretrained("urchade/gliner_multi_pii-v1")
+# entities = gliner.predict_entities(text, labels=["phone", "address", ...])
 ```
 
 ### Complete Training Script Example
@@ -681,8 +768,12 @@ tokenizer = TRMTokenizer("tokenizer/trm.model")
 dataset = TRMToolCallingDataset("data/train.jsonl", tokenizer)
 dataloader = create_dataloader(dataset, batch_size=32, shuffle=True)
 
-# 3. Create model
-config = TRMConfig(num_tools=len(dataset.tool_name_to_id))
+# 3. Create model (with URM innovations)
+config = TRMConfig(
+    num_tools=len(dataset.tool_name_to_id),
+    use_conv_swiglu=True,       # ConvSwiGLU for local feature mixing
+    tbptl_no_grad_steps=2,      # Skip loss on first 2 supervision steps
+)
 model = TRMForToolCalling(config).to(device)
 
 # 4. Setup training
@@ -699,19 +790,18 @@ for epoch in range(100):
         # Move to device
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        # Forward
+        # Forward (TBPTL: first 2 steps run without gradients)
         all_outputs = model.train_step(
             batch["input_ids"],
             batch["attention_mask"],
             batch["role_ids"],
         )
 
-        # Loss
+        # Loss (computed on collected outputs only)
         losses = loss_fn(
             all_outputs,
             batch["decision_labels"],
             batch["tool_name_labels"],
-            batch["slot_presence_labels"],
         )
 
         # Backward

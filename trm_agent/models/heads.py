@@ -3,9 +3,10 @@
 Output heads for the TRM model:
 - DecisionHead: tool_call vs direct_answer (binary classification)
 - ToolHead: Tool name prediction
-- UnifiedParamHead: Unified extraction for slots + tool params with masking
 - QHead: Halting probability for ACT (Adaptive Computational Time)
 - ContentHead: Response generation (not trained in Phase 1)
+
+Note: Span extraction (slots/params) is handled by GLiNER2, not TRM.
 """
 
 import torch
@@ -84,71 +85,6 @@ class ToolHead(nn.Module):
         return self.tool_classifier(y_pooled)
 
 
-class UnifiedParamHead(nn.Module):
-    """Unified parameter extraction head.
-
-    Combines slot extraction and tool param extraction into one head.
-    Uses decision-based + tool-based masking during loss computation:
-    - direct_answer: only slot fields valid (first num_slots)
-    - tool_call: slot fields + tool-specific params valid
-
-    The unified_fields = slot_fields + tool_param_fields (deduplicated).
-    Slots are always extracted regardless of decision.
-    Tool params are only valid for tool_call with tool-specific masking.
-    """
-
-    def __init__(self, config: TRMConfig):
-        super().__init__()
-        self.config = config
-        self.num_unified = config.num_unified_fields
-        self.num_slots = config.num_slots
-
-        self.norm = RMSNorm(config.hidden_size)
-
-        # Single set of span extractors for all unified fields
-        self.start_classifier = nn.Linear(
-            config.hidden_size, self.num_unified, bias=False
-        )
-        self.end_classifier = nn.Linear(
-            config.hidden_size, self.num_unified, bias=False
-        )
-
-        # Presence classifier (whether field is filled)
-        self.presence_classifier = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size // 2, bias=False),
-            nn.GELU(),
-            nn.Linear(config.hidden_size // 2, self.num_unified, bias=False),
-        )
-
-    def forward(self, y: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Predict unified field spans and presence.
-
-        Args:
-            y: Answer embedding [batch, seq_len, hidden_size]
-
-        Returns:
-            Dictionary with:
-            - param_start_logits: [batch, seq_len, num_unified_fields]
-            - param_end_logits: [batch, seq_len, num_unified_fields]
-            - param_presence_logits: [batch, num_unified_fields]
-        """
-        y = self.norm(y)
-
-        # Span prediction (per token)
-        param_start_logits = self.start_classifier(y)
-        param_end_logits = self.end_classifier(y)
-
-        # Presence prediction (pooled)
-        y_pooled = y.mean(dim=1)
-        param_presence_logits = self.presence_classifier(y_pooled)
-
-        return {
-            "param_start_logits": param_start_logits,
-            "param_end_logits": param_end_logits,
-            "param_presence_logits": param_presence_logits,
-        }
-
-
 class QHead(nn.Module):
     """Q-head for Adaptive Computational Time (ACT).
 
@@ -213,7 +149,8 @@ class OutputHead(nn.Module):
     Combines all prediction heads into a single module:
     - DecisionHead: tool_call vs direct_answer
     - ToolHead: which tool to call
-    - UnifiedParamHead: slots + tool params (with decision+tool masking)
+
+    Note: Span extraction (slots/params) is handled by GLiNER2.
     """
 
     def __init__(self, config: TRMConfig):
@@ -222,7 +159,6 @@ class OutputHead(nn.Module):
 
         self.decision_head = DecisionHead(config)
         self.tool_head = ToolHead(config)
-        self.unified_param_head = UnifiedParamHead(config)
         self.content_head = ContentHead(config)  # Not trained in Phase 1
 
     def forward(
@@ -234,14 +170,12 @@ class OutputHead(nn.Module):
             y: Answer embedding [batch, seq_len, hidden_size]
 
         Returns:
-            Dictionary with all prediction outputs
+            Dictionary with decision_logits and tool_logits
         """
         decision_logits = self.decision_head(y)
         tool_logits = self.tool_head(y)
-        param_outputs = self.unified_param_head(y)
 
         return {
             "decision_logits": decision_logits,
             "tool_logits": tool_logits,
-            **param_outputs,
         }

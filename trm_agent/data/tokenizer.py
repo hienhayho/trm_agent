@@ -431,6 +431,9 @@ class TRMTokenizer:
         vocab_size: int = 32000,
         character_coverage: float = 0.9995,
         model_type: str = "unigram",
+        input_sentence_size: int = 1000000,
+        shuffle_input_sentence: bool = True,
+        max_sentence_length: int = 16384,
     ) -> "TRMTokenizer":
         """Train a new SentencePiece model.
 
@@ -440,6 +443,9 @@ class TRMTokenizer:
             vocab_size: Target vocabulary size
             character_coverage: Character coverage for training
             model_type: Model type (unigram, bpe, word, char)
+            input_sentence_size: Max sentences to sample (default 1M, 0 = unlimited)
+            shuffle_input_sentence: Shuffle sentences before sampling
+            max_sentence_length: Max sentence length in characters (default 16384)
 
         Returns:
             Trained TRMTokenizer
@@ -455,22 +461,32 @@ class TRMTokenizer:
         ]
 
         # Train SentencePiece
-        spm.SentencePieceTrainer.Train(
-            input=",".join(str(f) for f in input_files),
-            model_prefix=str(output_path),
-            vocab_size=vocab_size,
-            character_coverage=character_coverage,
-            model_type=model_type,
-            pad_id=0,
-            unk_id=1,
-            bos_id=2,
-            eos_id=3,
-            pad_piece="<pad>",
-            unk_piece="<unk>",
-            bos_piece="<bos>",
-            eos_piece="<eos>",
-            user_defined_symbols=user_defined_symbols,
-        )
+        train_args = {
+            "input": ",".join(str(f) for f in input_files),
+            "model_prefix": str(output_path),
+            "vocab_size": vocab_size,
+            "character_coverage": character_coverage,
+            "model_type": model_type,
+            "pad_id": 0,
+            "unk_id": 1,
+            "bos_id": 2,
+            "eos_id": 3,
+            "pad_piece": "<pad>",
+            "unk_piece": "<unk>",
+            "bos_piece": "<bos>",
+            "eos_piece": "<eos>",
+            "user_defined_symbols": user_defined_symbols,
+        }
+
+        # Add sentence sampling to speed up training on large datasets
+        if input_sentence_size > 0:
+            train_args["input_sentence_size"] = input_sentence_size
+            train_args["shuffle_input_sentence"] = shuffle_input_sentence
+
+        # Set max sentence length to handle long conversations
+        train_args["max_sentence_length"] = max_sentence_length
+
+        spm.SentencePieceTrainer.Train(**train_args)
 
         # Load and return the trained tokenizer
         tokenizer = cls(vocab_size=vocab_size)

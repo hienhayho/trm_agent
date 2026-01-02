@@ -2,6 +2,8 @@
 
 This document describes how training data is loaded, tokenized, and prepared for the TRM model.
 
+> **Note:** Slot/parameter extraction is handled by **GLiNER2**, not TRM. TRM only handles decision classification (tool_call vs direct_answer) and tool selection.
+
 ## Overview
 
 The data pipeline consists of three main components:
@@ -38,7 +40,6 @@ JSONL File
 │  │ │ Build labels                                │   │  │
 │  │ │ - decision_label (0 or 1)                   │   │  │
 │  │ │ - tool_name_label (tool ID or -1)           │   │  │
-│  │ │ - slot_presence_labels [num_slots]          │   │  │
 │  │ └─────────────────────────────────────────────┘   │  │
 │  └───────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
@@ -195,9 +196,10 @@ Each sample from `dataset[idx]` returns:
     "role_ids": torch.Tensor,            # [seq_len] Role ID per position
     "decision_label": torch.Tensor,      # Scalar: 0 (direct_answer) or 1 (tool_call)
     "tool_name_label": torch.Tensor,     # Scalar: Tool ID or -1 if not tool_call
-    "slot_presence_labels": torch.Tensor # [num_slots] Binary presence for each slot
 }
 ```
+
+> **Note:** Slot extraction is handled by GLiNER2, not TRM dataset.
 
 ### Sample Building Process
 
@@ -242,22 +244,10 @@ JSONL Sample:
 └─────────────────────────────────────────────────────────┘
                 │
                 ▼
-┌─────────────────────────────────────────────────────────┐
-│ Step 4: Create slot presence labels                     │
-│                                                         │
-│ slots = sample["slots"]                                 │
-│ slot_fields = ["address", "phone", "name", ...]         │
-│                                                         │
-│ slot_presence_labels = [                                │
-│     0.0,  # address: empty                              │
-│     1.0,  # phone: "0901234567" (has value)             │
-│     1.0,  # name: "John" (has value)                    │
-│     ...                                                 │
-│ ]                                                       │
-└─────────────────────────────────────────────────────────┘
-                │
-                ▼
             Final Sample
+
+Note: The "slots" field in JSONL is preserved for GLiNER2 usage but
+not processed by TRMToolCallingDataset. Slot extraction uses GLiNER2.
 ```
 
 ### Tool Name Mapping
@@ -338,7 +328,6 @@ batch = {
     "role_ids": torch.Tensor,            # [batch_size, max_len]
     "decision_labels": torch.Tensor,     # [batch_size]
     "tool_name_labels": torch.Tensor,    # [batch_size]
-    "slot_presence_labels": torch.Tensor # [batch_size, num_slots]
 }
 ```
 
@@ -376,13 +365,12 @@ for batch in dataloader:
     role_ids = batch["role_ids"]                # [B, L]
     decision_labels = batch["decision_labels"]  # [B]
     tool_name_labels = batch["tool_name_labels"] # [B]
-    slot_labels = batch["slot_presence_labels"]  # [B, num_slots]
 
     # Forward pass
     outputs = model(input_ids, attention_mask, role_ids)
 
     # Compute loss
-    loss = loss_fn(outputs, decision_labels, tool_name_labels, slot_labels)
+    loss = loss_fn(outputs, decision_labels, tool_name_labels)
 ```
 
 ## Complete Example

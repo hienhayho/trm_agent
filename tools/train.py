@@ -40,6 +40,7 @@ Example:
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import torch
@@ -56,6 +57,7 @@ from trm_agent.utils import (
     barrier,
     cleanup_distributed,
     get_logger,
+    get_world_size,
     is_distributed,
     is_main_process,
     setup_distributed,
@@ -133,13 +135,18 @@ def train_tokenizer_from_data(
     data_paths: list[str | Path],
     output_dir: Path,
     vocab_size: int = 32000,
+    input_sentence_size: int = 0,  # 0 = use all sentences (no sampling)
 ) -> TRMTokenizer:
     """Train a tokenizer from the training data.
+
+    If a *_tokenizer.txt file exists alongside the training JSONL,
+    it will be used instead of extracting text (avoids duplicates).
 
     Args:
         data_paths: List of paths to JSONL training files
         output_dir: Directory to save tokenizer
         vocab_size: Vocabulary size
+        input_sentence_size: Max sentences to sample for training (default 1M)
 
     Returns:
         Trained TRMTokenizer
@@ -147,23 +154,51 @@ def train_tokenizer_from_data(
     tokenizer_dir = output_dir / "tokenizer"
     tokenizer_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract text to a temporary file
-    text_file = tokenizer_dir / "train_text.txt"
-    extract_text_for_tokenizer(data_paths, text_file)
+    # Check for pre-generated tokenizer text files (from convert script)
+    # These files have _tokenizer.txt suffix and contain no duplicates
+    tokenizer_text_files = []
+    for data_path in data_paths:
+        data_path = Path(data_path)
+        tokenizer_txt = data_path.parent / (data_path.stem + "_tokenizer.txt")
+        if tokenizer_txt.exists():
+            tokenizer_text_files.append(tokenizer_txt)
+            logger.info(f"Found tokenizer text file: {tokenizer_txt}")
+
+    if tokenizer_text_files:
+        # Use pre-generated tokenizer text files (no duplicates)
+        logger.info(f"Using {len(tokenizer_text_files)} pre-generated tokenizer text file(s)")
+        input_files = tokenizer_text_files
+        cleanup_text_file = False
+    else:
+        # Fall back to extracting text from JSONL (has duplicates)
+        logger.warning("No *_tokenizer.txt files found. Extracting from JSONL (may have duplicates).")
+        logger.warning("Consider running convert_raw_to_dataset.py to generate tokenizer text files.")
+        text_file = tokenizer_dir / "train_text.txt"
+        extract_text_for_tokenizer(data_paths, text_file)
+        input_files = [text_file]
+        cleanup_text_file = True
 
     # Train tokenizer
-    logger.info(f"Training tokenizer with vocab_size={vocab_size}...")
+    if input_sentence_size > 0:
+        logger.info(f"Training tokenizer with vocab_size={vocab_size}, "
+                    f"sampling {input_sentence_size} sentences...")
+    else:
+        logger.info(f"Training tokenizer with vocab_size={vocab_size}, "
+                    f"using ALL sentences (no sampling)...")
     tokenizer = TRMTokenizer.train(
-        input_files=[text_file],
+        input_files=input_files,
         output_path=tokenizer_dir / "tokenizer",
         vocab_size=vocab_size,
+        input_sentence_size=input_sentence_size,
+        shuffle_input_sentence=True,
     )
 
     logger.info(f"Tokenizer trained and saved to {tokenizer_dir}")
     logger.info(f"Vocabulary size: {len(tokenizer)}")
 
-    # Clean up temp text file
-    text_file.unlink()
+    # Clean up temp text file if we created it
+    if cleanup_text_file and input_files:
+        input_files[0].unlink()
 
     return tokenizer
 
@@ -278,6 +313,47 @@ def main():
         default=None,
         help="Number of layers (default: 2)",
     )
+    parser.add_argument(
+        "--no-conv-swiglu",
+        action="store_true",
+        help="Disable ConvSwiGLU (use standard SwiGLU, less memory)",
+    )
+    parser.add_argument(
+        "--no-trm-loop",
+        action="store_true",
+        help="Disable TRM recursive loop (single pass, let Mamba handle recurrence)",
+    )
+
+    # Hybrid architecture arguments (Mamba + MoE + Attention)
+    parser.add_argument(
+        "--use-hybrid",
+        action="store_true",
+        help="Use hybrid Mamba+MoE+Attention blocks (requires mamba-ssm)",
+    )
+    parser.add_argument(
+        "--num-experts",
+        type=int,
+        default=None,
+        help="Number of experts in MoE layer (default: 4)",
+    )
+    parser.add_argument(
+        "--experts-per-token",
+        type=int,
+        default=None,
+        help="Number of experts per token for top-k routing (default: 2)",
+    )
+    parser.add_argument(
+        "--mamba-version",
+        type=int,
+        choices=[1, 2],
+        default=None,
+        help="Mamba version to use: 1 (original) or 2 (improved SSD, default)",
+    )
+    parser.add_argument(
+        "--no-mamba-cuda-kernels",
+        action="store_true",
+        help="Disable Mamba2 CUDA kernels (use if training hangs)",
+    )
 
     # Other arguments
     parser.add_argument(
@@ -320,6 +396,22 @@ def main():
         model_config_dict["hidden_size"] = args.hidden_size
     if args.num_layers:
         model_config_dict["num_layers"] = args.num_layers
+    if args.no_conv_swiglu:
+        model_config_dict["use_conv_swiglu"] = False
+    if args.no_trm_loop:
+        model_config_dict["use_trm_loop"] = False
+
+    # Hybrid architecture overrides
+    if args.use_hybrid:
+        model_config_dict["use_hybrid_block"] = True
+    if args.num_experts is not None:
+        model_config_dict["num_experts"] = args.num_experts
+    if args.experts_per_token is not None:
+        model_config_dict["num_experts_per_tok"] = args.experts_per_token
+    if args.mamba_version is not None:
+        model_config_dict["mamba_version"] = args.mamba_version
+    if args.no_mamba_cuda_kernels:
+        model_config_dict["mamba_use_mem_eff_path"] = False
 
     if args.epochs:
         training_config_dict["num_epochs"] = args.epochs
@@ -342,20 +434,67 @@ def main():
     model_config = TRMConfig(**model_config_dict)
     training_config = TrainingConfig(**training_config_dict)
 
-    logger.info(f"Model config: {model_config}")
-    logger.info(f"Training config: {training_config}")
+    # Log model configuration
+    logger.info("=" * 60)
+    logger.info("Model Configuration:")
+    logger.info(f"  Architecture: hidden_size={model_config.hidden_size}, "
+                f"num_layers={model_config.num_layers}, num_heads={model_config.num_heads}")
+    logger.info(f"  Intermediate: {model_config.intermediate_size}, dropout={model_config.dropout}")
+    logger.info(f"  Sequence: max_seq_len={model_config.max_seq_len}, vocab_size={model_config.vocab_size}")
+    if model_config.use_trm_loop:
+        logger.info(f"  TRM recursion: ENABLED (n_latent={model_config.n_latent_recursion}, "
+                    f"T_deep={model_config.T_deep_recursion}, N_sup={model_config.N_supervision})")
+    else:
+        logger.info(f"  TRM recursion: DISABLED (single-pass mode, Mamba handles recurrence)")
+    logger.info(f"  URM innovations: use_conv_swiglu={model_config.use_conv_swiglu}, "
+                f"conv_kernel_size={model_config.conv_kernel_size}, "
+                f"tbptl_no_grad_steps={model_config.tbptl_no_grad_steps}")
+    if model_config.use_hybrid_block:
+        logger.info(f"  Hybrid block: ENABLED (Mamba + MoE + Attention)")
+        if model_config.mamba_version == 2:
+            cuda_kernels = "enabled" if model_config.mamba_use_mem_eff_path else "DISABLED"
+            logger.info(f"    Mamba2: headdim={model_config.mamba_headdim}, "
+                        f"d_conv={model_config.mamba_d_conv}, expand={model_config.mamba_expand}, "
+                        f"cuda_kernels={cuda_kernels}")
+        else:
+            logger.info(f"    Mamba1: d_state={model_config.mamba_d_state}, "
+                        f"d_conv={model_config.mamba_d_conv}, expand={model_config.mamba_expand}")
+        logger.info(f"    MoE: num_experts={model_config.num_experts}, "
+                    f"experts_per_tok={model_config.num_experts_per_tok}, "
+                    f"intermediate={model_config.moe_intermediate_size}")
+    else:
+        logger.info(f"  Hybrid block: disabled (standard Transformer)")
+    logger.info(f"  Loss weights: decision={model_config.decision_loss_weight}, "
+                f"tool={model_config.tool_loss_weight}, q={model_config.q_loss_weight}")
+    logger.info(f"  Focal loss: alpha={model_config.focal_alpha}, gamma={model_config.focal_gamma}")
+
+    # Log training configuration
+    world_size = get_world_size()
+    effective_batch_size = training_config.batch_size * training_config.gradient_accumulation_steps * world_size
+    logger.info("=" * 60)
+    logger.info("Training Configuration:")
+    logger.info(f"  Batch size: {training_config.batch_size} per GPU")
+    logger.info(f"  Gradient accumulation: {training_config.gradient_accumulation_steps} steps")
+    logger.info(f"  World size: {world_size} GPU(s)")
+    logger.info(f"  Effective batch size: {effective_batch_size} "
+                f"({training_config.batch_size} x {training_config.gradient_accumulation_steps} x {world_size})")
+    logger.info(f"  Learning rate: {training_config.learning_rate}")
+    logger.info(f"  Weight decay: {training_config.weight_decay}")
+    logger.info(f"  Warmup steps: {training_config.warmup_steps}")
+    logger.info(f"  Epochs: {training_config.num_epochs}")
+    logger.info(f"  AMP: {training_config.use_amp} ({training_config.amp_dtype})")
+    logger.info(f"  EMA: {training_config.use_ema} (decay={training_config.ema_decay})")
+    logger.info(f"  ACT: {training_config.use_act}")
+    logger.info("=" * 60)
 
     # Load or train tokenizer (only on rank 0)
     output_dir = Path(args.output_dir)
     if is_main_process():
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Synchronize before tokenizer operations
-    if is_distributed():
-        barrier()
-
     tokenizer = None
     tokenizer_path = None
+    tokenizer_ready_file = output_dir / "tokenizer" / ".ready"
 
     if args.tokenizer_path:
         tokenizer_path = args.tokenizer_path
@@ -366,7 +505,12 @@ def main():
             tokenizer_path = existing_tokenizer
         elif is_main_process():
             # Train tokenizer from training data (only rank 0)
+            # Remove ready file if exists (from previous run)
+            if tokenizer_ready_file.exists():
+                tokenizer_ready_file.unlink()
+
             logger.info("No tokenizer specified. Training tokenizer from dataset...")
+            logger.info("(Other ranks will wait for tokenizer training to complete)")
             vocab_size = args.vocab_size or model_config.vocab_size
             train_tokenizer_from_data(
                 data_paths=args.train_data,
@@ -375,9 +519,20 @@ def main():
             )
             tokenizer_path = output_dir / "tokenizer" / "tokenizer.model"
 
-    # Wait for rank 0 to finish tokenizer training
-    if is_distributed():
-        barrier()
+            # Signal that tokenizer is ready
+            tokenizer_ready_file.touch()
+
+    # Wait for rank 0 to finish tokenizer training using file-based sync
+    # This avoids NCCL timeout during long tokenizer training
+    if is_distributed() and not args.tokenizer_path:
+        tokenizer_model_path = output_dir / "tokenizer" / "tokenizer.model"
+        if not is_main_process():
+            logger.info("Waiting for tokenizer training to complete...")
+            while not tokenizer_model_path.exists():
+                time.sleep(5)
+            # Wait a bit more to ensure file is fully written
+            time.sleep(2)
+            logger.info("Tokenizer ready, continuing...")
 
     # Now all ranks load the tokenizer
     if tokenizer_path is None:
@@ -385,6 +540,14 @@ def main():
 
     tokenizer = TRMTokenizer(tokenizer_path)
     logger.info(f"Loaded tokenizer from {tokenizer_path}")
+
+    # Sync model vocab_size with tokenizer's actual vocabulary size
+    model_config.vocab_size = len(tokenizer)
+    logger.info(f"Updated model vocab_size to match tokenizer: {model_config.vocab_size}")
+
+    # Sync all ranks before continuing
+    if is_distributed():
+        barrier()
 
     # Load datasets from multiple files
     all_datasets = []
@@ -395,7 +558,6 @@ def main():
             data_path=data_path,
             tokenizer=tokenizer,
             max_seq_len=model_config.max_seq_len,
-            slot_fields=model_config.slot_fields,
             tool_name_to_id=tool_name_to_id,  # Share tool mapping across files
         )
         # Get tool mapping from first dataset
@@ -414,11 +576,8 @@ def main():
     total_samples = sum(len(d) for d in all_datasets)
     logger.info(f"Total dataset: {total_samples} samples from {len(args.train_data)} file(s)")
 
-    # Get unified field info from first dataset
+    # Get first dataset for shared info
     first_dataset = all_datasets[0]
-    unified_fields = first_dataset.unified_fields
-    num_slots = first_dataset.num_slots
-    tool_param_mask = first_dataset.get_tool_param_mask_tensor()
 
     train_dataset = full_dataset
     val_dataset = None
@@ -429,18 +588,9 @@ def main():
             data_path=args.val_data,
             tokenizer=tokenizer,
             max_seq_len=model_config.max_seq_len,
-            slot_fields=model_config.slot_fields,
             tool_name_to_id=tool_name_to_id,
         )
         logger.info(f"Loaded validation dataset: {len(val_dataset)} samples")
-
-        # Log val dataset extraction stats (only on main process)
-        if is_main_process():
-            logger.info("Computing validation extraction statistics...")
-            val_stats = val_dataset.get_extraction_stats()
-            logger.info(f"Validation extraction stats:")
-            logger.info(f"  Samples with missing slots: {val_stats['samples_with_missing_slots']}/{val_stats['total_samples']}")
-            logger.info(f"  Samples with missing params: {val_stats['samples_with_missing_params']}/{val_stats['total_samples']}")
     elif args.val_split is not None and args.val_split > 0:
         # Split EACH training file and combine
         train_splits = []
@@ -476,86 +626,19 @@ def main():
             f"({args.val_split:.1%} validation per file)"
         )
 
-    # Update model config with actual tool count and unified fields
+    # Update model config with actual tool count
     model_config.num_tools = len(tool_name_to_id)
     logger.info(f"Number of tools: {model_config.num_tools}")
-
-    # Update model config with tool_param_fields from dataset
-    model_config.set_tool_param_fields(first_dataset.tool_param_fields)
-    logger.info(f"Model unified fields: {model_config.num_unified_fields} "
-                f"({model_config.num_slots} slots + {model_config.num_tool_params} params)")
-    logger.info(f"  Slots: {model_config.slot_fields}")
-    logger.info(f"  Tool params: {model_config.tool_param_fields}")
-
-    # Log per-tool parameter masks and find duplicates with slots
-    slot_set = set(model_config.slot_fields)
     for tool_name, tool_id in tool_name_to_id.items():
-        # Get active unique params (not in slots)
-        param_mask = first_dataset.tool_param_mask.get(tool_name, [])
-        active_params = [
-            first_dataset.tool_param_fields[i]
-            for i, m in enumerate(param_mask) if m == 1
-        ]
+        logger.info(f"  Tool '{tool_name}' (id={tool_id})")
 
-        # Find params that were deduplicated (exist in slots)
-        # Need to get original tool params from samples
-        duplicated_params: list[str] = []
-        found_tool = False
-        for sample in first_dataset.samples:
-            for tool in sample.get("tools", []):
-                func = tool.get("function", {})
-                if func.get("name") == tool_name:
-                    raw_params = set(func.get("parameters", {}).get("properties", {}).keys())
-                    duplicated_params = sorted(raw_params & slot_set)
-                    found_tool = True
-                    break
-            if found_tool:
-                break
-
-        log_msg = f"  Tool '{tool_name}' (id={tool_id}): params={active_params}"
-        if duplicated_params:
-            log_msg += f", duplicated_with_slots={duplicated_params}"
-        logger.info(log_msg)
-
-    # Log extraction statistics (only on main process)
+    # Log dataset statistics
     if is_main_process():
-        logger.info("Computing extraction statistics...")
-        extraction_stats = first_dataset.get_extraction_stats()
-        logger.info(f"Extraction stats (samples with missing spans):")
-        logger.info(f"  Samples with missing slots: {extraction_stats['samples_with_missing_slots']}/{extraction_stats['total_samples']}")
-        logger.info(f"  Samples with missing params: {extraction_stats['samples_with_missing_params']}/{extraction_stats['total_samples']}")
-
-        # Per-slot extraction rates
-        logger.info("  Per-slot extraction:")
-        for field, field_stats in extraction_stats["slot_extraction"].items():
-            if field_stats["total"] > 0:
-                rate = field_stats["found"] / field_stats["total"] * 100
-                logger.info(f"    {field}: {field_stats['found']}/{field_stats['total']} ({rate:.1f}%) - missing: {field_stats['missing']}")
-
-        # Per-param extraction rates
-        if extraction_stats["param_extraction"]:
-            logger.info("  Per-param extraction:")
-            for field, field_stats in extraction_stats["param_extraction"].items():
-                if field_stats["total"] > 0:
-                    rate = field_stats["found"] / field_stats["total"] * 100
-                    logger.info(f"    {field}: {field_stats['found']}/{field_stats['total']} ({rate:.1f}%) - missing: {field_stats['missing']}")
-
-        # Log examples for problematic fields (< 50% extraction rate)
-        analysis = first_dataset.analyze_extraction_failures(max_examples_per_field=2)
-        if analysis["problematic_fields"]:
-            logger.warning(f"Problematic fields with <50% extraction rate: {analysis['problematic_fields']}")
-            logger.warning("These fields may be GENERATED (not extracted from text). Consider:")
-            logger.warning("  1. Removing from slot_fields if they're not extractable")
-            logger.warning("  2. Using fuzzy matching for format variations")
-            logger.warning("  3. Treating as generation task instead of extraction")
-
-            for field in analysis["problematic_fields"]:
-                examples = analysis["examples"].get(field, [])
-                if examples:
-                    logger.warning(f"  Examples for '{field}':")
-                    for ex in examples[:2]:
-                        logger.warning(f"    Value: '{ex['value']}'")
-                        logger.warning(f"    Text: '{ex['text_snippet'][:150]}...'")
+        stats = first_dataset.get_label_statistics()
+        logger.info(f"Dataset statistics:")
+        logger.info(f"  Total samples: {stats['total_samples']}")
+        logger.info(f"  Tool calls: {stats['tool_call']} ({stats['tool_call_ratio']:.1%})")
+        logger.info(f"  Direct answers: {stats['direct_answer']}")
 
     # Create data loaders
     pad_token_id = tokenizer.pad_token_id if tokenizer else 0
@@ -586,13 +669,54 @@ def main():
     # Wrap with DDP if distributed
     if is_distributed():
         local_rank = device.index  # Get GPU index from device
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            static_graph=True,  # Graph structure is fixed, enables optimizations
-        )
-        logger.info("Wrapped model with DDP")
+        # Note: static_graph=True causes hangs with Mamba2's custom CUDA kernels
+        # Use find_unused_parameters for hybrid mode, static_graph for standard mode
+        if model_config.use_hybrid_block:
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=True,  # Required for Mamba2 compatibility
+            )
+            logger.info("Wrapped model with DDP (find_unused_parameters=True for hybrid mode)")
+        else:
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                static_graph=True,  # Graph structure is fixed, enables optimizations
+            )
+            logger.info("Wrapped model with DDP (static_graph=True)")
+
+    # Warmup for Mamba2 Triton kernels (compile JIT kernels before training)
+    if model_config.use_hybrid_block and model_config.mamba_version == 2:
+        logger.info("Running Mamba2 warmup to compile Triton kernels...")
+        try:
+            # Get a sample batch for warmup
+            warmup_batch = next(iter(train_dataloader))
+            warmup_batch = {k: v.to(device) for k, v in warmup_batch.items()}
+
+            # Run forward pass to trigger kernel compilation
+            with torch.no_grad():
+                _ = model.module.forward(
+                    input_ids=warmup_batch["input_ids"],
+                    attention_mask=warmup_batch["attention_mask"],
+                    role_ids=warmup_batch["role_ids"],
+                ) if is_distributed() else model.forward(
+                    input_ids=warmup_batch["input_ids"],
+                    attention_mask=warmup_batch["attention_mask"],
+                    role_ids=warmup_batch["role_ids"],
+                )
+
+            # Sync CUDA to ensure kernels are compiled
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            logger.info("Mamba2 warmup completed successfully!")
+        except Exception as e:
+            logger.error(f"Mamba2 warmup failed: {e}")
+            logger.error("Try using --no-mamba-cuda-kernels or --mamba-version 1")
+            raise
 
     # Create trainer
     trainer = TRMTrainer(
@@ -603,10 +727,6 @@ def main():
         eval_dataloader=val_dataloader,
         device=device,
         tool_names=list(tool_name_to_id.keys()),
-        unified_fields=unified_fields,
-        num_slots=num_slots,
-        tool_param_mask=tool_param_mask,
-        tokenizer=tokenizer,
     )
 
     # Resume from checkpoint if specified

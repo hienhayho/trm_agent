@@ -37,6 +37,7 @@ Environment Variables:
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -229,11 +230,15 @@ def load_model():
     print(f"Tool params mapping: {tool_param_mapping}")
 
     # Initialize GLiNER2 extractor
-    slot_fields = (
-        config.slot_fields
-        if config and hasattr(config, "slot_fields")
-        else ["address", "phone", "device_number", "intent_of_user", "name", "contract_id"]
-    )
+    # Note: slot_fields are now handled by GLiNER2 only (not TRM)
+    slot_fields = [
+        "address",
+        "phone",
+        "device_number",
+        "intent_of_user",
+        "name",
+        "contract_id",
+    ]
     adapter_path = GLINER2_ADAPTER if GLINER2_ADAPTER else None
     gliner2_extractor = GLiNER2Extractor(
         model_name=GLINER2_MODEL,
@@ -406,11 +411,16 @@ def predict_with_trm(history: list[dict]) -> tuple[str, Optional[str], dict, dic
     return decision, tool_name, tool_args, slots
 
 
-async def generate_response(history: list[dict]) -> str:
-    """Generate response using OpenAI API."""
-    global openai_client
+def build_oss_messages(history: list[dict], after_tool: bool = False) -> list[dict]:
+    """Build messages list for OSS API.
 
-    # Convert history to OpenAI format
+    Args:
+        history: Conversation history
+        after_tool: Whether this is after a tool call
+
+    Returns:
+        List of message dicts for OpenAI API
+    """
     messages = []
     for msg in history:
         role = msg["role"]
@@ -438,6 +448,29 @@ async def generate_response(history: list[dict]) -> str:
                 {"role": "user", "content": f"[Tool Result: {tool_result}]"}
             )
 
+    # Add instruction to summarize tool result (not call more tools)
+    if after_tool:
+        messages.append(
+            {
+                "role": "user",
+                "content": "Hãy tổng hợp kết quả tool ở trên và trả lời khách hàng bằng ngôn ngữ tự nhiên. KHÔNG gọi thêm tool.",
+            }
+        )
+
+    return messages
+
+
+async def generate_response(history: list[dict], after_tool: bool = False) -> str:
+    """Generate response using OpenAI API.
+
+    Args:
+        history: Conversation history
+        after_tool: Whether this is generating response after a tool call
+    """
+    global openai_client
+
+    messages = build_oss_messages(history, after_tool)
+
     try:
         response = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -445,7 +478,17 @@ async def generate_response(history: list[dict]) -> str:
             temperature=0.7,
             max_tokens=512,
         )
-        return response.choices[0].message.content
+        result = response.choices[0].message.content
+
+        # Filter out special tokens if model outputs them
+        if result and "<|" in result:
+            # Remove special tokens like <|start|>, <|channel|>, etc.
+            result = re.sub(r"<\|[^|]+\|>", "", result).strip()
+            # If result is empty after filtering, return a fallback
+            if not result:
+                result = "Dạ, em đã nhận được thông tin. Anh/chị cần em hỗ trợ thêm gì không ạ?"
+
+        return result
     except Exception as e:
         return f"Xin lỗi, em gặp lỗi khi xử lý yêu cầu: {str(e)}"
 
@@ -504,15 +547,23 @@ async def on_message(message: cl.Message):
                 if arg not in labels:
                     labels.append(arg)
 
-        gliner_step.input = json.dumps({
-            "text": full_text[-500:] + "..." if len(full_text) > 500 else full_text,
-            "labels": labels,
-        }, ensure_ascii=False, indent=2)
+        gliner_step.input = json.dumps(
+            {
+                "text": full_text[-500:] + "..." if len(full_text) > 500 else full_text,
+                "labels": labels,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
-        gliner_step.output = json.dumps({
-            "slots": slots,
-            "tool_args": tool_args,
-        }, ensure_ascii=False, indent=2)
+        gliner_step.output = json.dumps(
+            {
+                "slots": slots,
+                "tool_args": tool_args,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     if decision == "tool_call" and tool_name:
         # Step 3: Tool Execution
@@ -530,11 +581,20 @@ async def on_message(message: cl.Message):
         )
         history.append({"role": "tool_response", "content": tool_result})
 
-        # Generate response based on tool result
-        response = await generate_response(history)
+        # Step 4: LLM Response Generation
+        async with cl.Step(name="LLM Generation", type="llm") as llm_step:
+            # Build messages preview for input
+            messages_preview = build_oss_messages(history, after_tool=True)
+            llm_step.input = json.dumps(messages_preview, ensure_ascii=False, indent=2)
+            response = await generate_response(history, after_tool=True)
+            llm_step.output = response
     else:
-        # Direct answer - generate response
-        response = await generate_response(history)
+        # Step: LLM Response Generation (direct answer)
+        async with cl.Step(name="LLM Generation", type="llm") as llm_step:
+            messages_preview = build_oss_messages(history, after_tool=False)
+            llm_step.input = json.dumps(messages_preview, ensure_ascii=False, indent=2)
+            response = await generate_response(history, after_tool=False)
+            llm_step.output = response
 
     # Add assistant response to history
     history.append({"role": "assistant", "content": response})

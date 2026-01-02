@@ -9,6 +9,10 @@ Key concepts:
 - Single 2-layer network for both z and y updates
 - Deep recursion with T-1 no-grad + 1 with-grad iterations
 - Deep supervision with N_sup supervision steps
+
+URM Innovations (from Universal Reasoning Model paper):
+- ConvSwiGLU: Short convolution in MLP for local feature mixing
+- TBPTL: Truncated Backprop Through Loops - skip loss on first K supervision steps
 """
 
 from dataclasses import dataclass
@@ -25,14 +29,13 @@ from .layers import TRMBlock
 
 @dataclass
 class TRMOutput:
-    """Output from TRM forward pass."""
+    """Output from TRM forward pass.
+
+    Note: Span extraction (slots/params) is handled by GLiNER2, not TRM.
+    """
 
     decision_logits: torch.Tensor  # [batch, 1]
     tool_logits: torch.Tensor  # [batch, num_tools]
-    # Unified param outputs (slots + tool_params combined)
-    param_start_logits: torch.Tensor  # [batch, seq_len, num_unified_fields]
-    param_end_logits: torch.Tensor  # [batch, seq_len, num_unified_fields]
-    param_presence_logits: torch.Tensor  # [batch, num_unified_fields]
     q_logits: torch.Tensor  # [batch, 1]
     y: torch.Tensor  # [batch, seq_len, hidden_size]
     z: torch.Tensor  # [batch, seq_len, hidden_size]
@@ -186,7 +189,7 @@ class TRMForToolCalling(nn.Module):
         # Detach y and z for next supervision step
         return y.detach(), z.detach(), outputs, q
 
-    def forward(
+    def _forward_single_pass(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -194,20 +197,48 @@ class TRMForToolCalling(nn.Module):
         tool_ids: Optional[torch.Tensor] = None,
         return_all_steps: bool = False,
     ) -> TRMOutput | list[TRMOutput]:
-        """Forward pass with optional deep supervision.
+        """Single-pass forward without TRM recursion.
+
+        When use_trm_loop=False, the model does a single forward pass
+        letting Mamba's state space handle recurrence internally.
+
+        Flow: input -> embed -> net -> output_head
+        """
+        # Embed input
+        x = self.input_embedding(input_ids, role_ids, tool_ids, attention_mask)
+
+        # Single pass through network (Mamba handles recurrence)
+        h = self.net(x, attention_mask)
+
+        # Get predictions from output heads
+        outputs = self.output_head(h)
+        q = self.q_head(h)
+
+        output = TRMOutput(
+            decision_logits=outputs["decision_logits"],
+            tool_logits=outputs["tool_logits"],
+            q_logits=q,
+            y=h,  # Use hidden state as y
+            z=h,  # Use hidden state as z (no separate latent)
+        )
+
+        # For training compatibility, return as list if requested
+        if return_all_steps:
+            return [output]
+        return output
+
+    def _forward_with_trm_loop(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        role_ids: Optional[torch.Tensor] = None,
+        tool_ids: Optional[torch.Tensor] = None,
+        return_all_steps: bool = False,
+    ) -> TRMOutput | list[TRMOutput]:
+        """Forward pass with TRM recursive loop and deep supervision.
 
         During training, the model iterates through N_sup supervision steps,
-        each time improving y and z.
-
-        Args:
-            input_ids: Token IDs [batch, seq_len]
-            attention_mask: Attention mask [batch, seq_len]
-            role_ids: Role IDs [batch, seq_len]
-            tool_ids: Tool IDs [batch, num_tools]
-            return_all_steps: If True, return outputs from all supervision steps
-
-        Returns:
-            TRMOutput or list of TRMOutput (if return_all_steps=True)
+        each time improving y and z through latent recursion.
         """
         batch_size, seq_len = input_ids.shape
 
@@ -224,20 +255,30 @@ class TRMForToolCalling(nn.Module):
 
         if return_all_steps:
             all_outputs = []
-            for _ in range(self.config.N_supervision):
-                y, z, outputs, q = self.deep_recursion(x, y, z, attention_mask)
-                all_outputs.append(
-                    TRMOutput(
-                        decision_logits=outputs["decision_logits"],
-                        tool_logits=outputs["tool_logits"],
-                        param_start_logits=outputs["param_start_logits"],
-                        param_end_logits=outputs["param_end_logits"],
-                        param_presence_logits=outputs["param_presence_logits"],
-                        q_logits=q,
-                        y=y,
-                        z=z,
+            # TBPTL: Skip loss computation on first K steps (only during training)
+            # Use torch.no_grad() for skipped steps to save memory
+            no_grad_steps = self.config.tbptl_no_grad_steps if self.training else 0
+
+            for step in range(self.config.N_supervision):
+                if step < no_grad_steps:
+                    # First K steps: no gradients (TBPTL memory optimization)
+                    with torch.no_grad():
+                        y, z, outputs, q = self.deep_recursion(x, y, z, attention_mask)
+                    # Detach y, z for next step to break gradient chain
+                    y = y.detach()
+                    z = z.detach()
+                else:
+                    # Remaining steps: compute gradients and collect for loss
+                    y, z, outputs, q = self.deep_recursion(x, y, z, attention_mask)
+                    all_outputs.append(
+                        TRMOutput(
+                            decision_logits=outputs["decision_logits"],
+                            tool_logits=outputs["tool_logits"],
+                            q_logits=q,
+                            y=y,
+                            z=z,
+                        )
                     )
-                )
             return all_outputs
 
         # Single pass (for inference or last step)
@@ -246,13 +287,45 @@ class TRMForToolCalling(nn.Module):
         return TRMOutput(
             decision_logits=outputs["decision_logits"],
             tool_logits=outputs["tool_logits"],
-            param_start_logits=outputs["param_start_logits"],
-            param_end_logits=outputs["param_end_logits"],
-            param_presence_logits=outputs["param_presence_logits"],
             q_logits=q,
             y=y,
             z=z,
         )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        role_ids: Optional[torch.Tensor] = None,
+        tool_ids: Optional[torch.Tensor] = None,
+        return_all_steps: bool = False,
+    ) -> TRMOutput | list[TRMOutput]:
+        """Forward pass with optional TRM recursion and deep supervision.
+
+        When use_trm_loop=True (default):
+            Uses TRM recursive algorithm with latent y/z refinement.
+
+        When use_trm_loop=False:
+            Single forward pass, lets Mamba's state space handle recurrence.
+
+        Args:
+            input_ids: Token IDs [batch, seq_len]
+            attention_mask: Attention mask [batch, seq_len]
+            role_ids: Role IDs [batch, seq_len]
+            tool_ids: Tool IDs [batch, num_tools]
+            return_all_steps: If True, return outputs from all supervision steps
+
+        Returns:
+            TRMOutput or list of TRMOutput (if return_all_steps=True)
+        """
+        if self.config.use_trm_loop:
+            return self._forward_with_trm_loop(
+                input_ids, attention_mask, role_ids, tool_ids, return_all_steps
+            )
+        else:
+            return self._forward_single_pass(
+                input_ids, attention_mask, role_ids, tool_ids, return_all_steps
+            )
 
     def train_step(
         self,
@@ -303,9 +376,6 @@ class TRMForToolCalling(nn.Module):
         return TRMOutput(
             decision_logits=outputs["decision_logits"],
             tool_logits=outputs["tool_logits"],
-            param_start_logits=outputs["param_start_logits"],
-            param_end_logits=outputs["param_end_logits"],
-            param_presence_logits=outputs["param_presence_logits"],
             q_logits=q,
             y=y,
             z=z,

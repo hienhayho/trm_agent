@@ -1,7 +1,8 @@
 """
-TRM Evaluation Script.
+TRM + GLiNER2 Evaluation Script.
 
-Evaluate trained TRM model on test data. Supports single GPU and multi-GPU inference.
+Evaluate trained TRM model (decision + tool selection) with GLiNER2 (entity extraction)
+on test data. Supports single GPU and multi-GPU inference.
 
 Usage:
     # Single GPU:
@@ -9,6 +10,13 @@ Usage:
         --checkpoint outputs/checkpoint_epoch_1.pt \
         --test-data data/test.json \
         --tokenizer-path outputs/tokenizer/tokenizer.model
+
+    # With GLiNER2 LoRA adapter:
+    uv run python tools/test.py \
+        --checkpoint outputs/checkpoint_epoch_1.pt \
+        --test-data data/test.json \
+        --tokenizer-path outputs/tokenizer/tokenizer.model \
+        --gliner2-adapter outputs/gliner2/best
 
     # Multi-GPU with torchrun:
     uv run torchrun --nproc_per_node=2 tools/test.py \
@@ -56,6 +64,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from trm_agent.data import TRMTokenizer
+from trm_agent.inference import GLiNER2Extractor
 from trm_agent.models import TRMConfig, TRMForToolCalling
 from trm_agent.utils import (
     cleanup_distributed,
@@ -326,6 +335,24 @@ def collate_test_batch(batch: list[dict]) -> dict:
     }
 
 
+def conversation_to_text(history: list[dict]) -> str:
+    """Convert conversation history to plain text for GLiNER2."""
+    parts = []
+    for msg in history:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        if isinstance(content, str):
+            parts.append(f"{role}: {content}")
+        elif isinstance(content, dict):
+            if "name" in content:
+                parts.append(f"{role}: [tool: {content.get('name')}]")
+            else:
+                parts.append(f"{role}: {json.dumps(content, ensure_ascii=False)}")
+
+    return "\n".join(parts)
+
+
 @torch.no_grad()
 def run_batched_inference(
     model: TRMForToolCalling,
@@ -333,11 +360,10 @@ def run_batched_inference(
     samples: list[dict],
     device: torch.device,
     tool_name_to_id: dict[str, int],
-    param_name_to_idx: dict[str, int],
-    num_slots: int,
-    tool_param_mask: dict[str, list[int]],
+    gliner2_extractor: GLiNER2Extractor,
+    tool_param_mapping: dict[str, list[str]],
 ) -> list[tuple[int, dict]]:
-    """Run batched inference with unified field extraction.
+    """Run batched inference with TRM (decision + tool) and GLiNER2 (entity extraction).
 
     Args:
         model: TRM model
@@ -345,15 +371,13 @@ def run_batched_inference(
         samples: List of test samples
         device: Device to run on
         tool_name_to_id: Tool name to ID mapping
-        param_name_to_idx: Param name to unified index mapping
-        num_slots: Number of slot fields (first num_slots in unified)
-        tool_param_mask: Per-tool mask for valid params
+        gliner2_extractor: GLiNER2 extractor for entity extraction
+        tool_param_mapping: Tool name to param list mapping
 
     Returns:
         List of (global_index, prediction) tuples for samples processed by this rank.
     """
     id_to_name = {v: k for k, v in tool_name_to_id.items()}
-    idx_to_param = {v: k for k, v in param_name_to_idx.items()}
     local_predictions = []
 
     # Only show progress bar on main process
@@ -366,8 +390,6 @@ def run_batched_inference(
         attention_mask = batch["attention_mask"].to(device)
         role_ids = batch["role_ids"].to(device)
         indices = batch["indices"]
-        full_texts = batch["full_texts"]
-        offsets_list = batch["offsets_list"]
 
         outputs = model(
             input_ids=input_ids,
@@ -380,8 +402,7 @@ def run_batched_inference(
 
         for i in range(batch_size):
             idx = indices[i]
-            full_text = full_texts[i]
-            token_offsets = offsets_list[i]
+            sample = samples[idx]
 
             decision_prob = torch.sigmoid(outputs.decision_logits[i]).item()
             decision = "tool_call" if decision_prob > 0.5 else "direct_answer"
@@ -391,41 +412,28 @@ def run_batched_inference(
                 "decision_prob": decision_prob,
                 "tool_name": None,
                 "tool_args": {},
-                "arg_spans": {},
+                "slots": {},
             }
 
+            tool_name = None
             if decision == "tool_call":
                 tool_pred_idx = outputs.tool_logits[i].argmax().item()
                 tool_name = id_to_name.get(tool_pred_idx, f"tool_{tool_pred_idx}")
                 result["tool_name"] = tool_name
 
-                # Extract tool params using unified indices
-                if tool_name in tool_param_mask:
-                    mask = tool_param_mask[tool_name]
-                    num_unified = outputs.param_start_logits.size(2)
+            # Use GLiNER2 for entity extraction
+            if gliner2_extractor is not None:
+                # Build full text from conversation history
+                full_text = conversation_to_text(sample["history"])
 
-                    for param_rel_idx, is_valid in enumerate(mask):
-                        if is_valid:
-                            unified_idx = num_slots + param_rel_idx
-                            if unified_idx < num_unified:
-                                # Get param name
-                                param_name = idx_to_param.get(unified_idx)
-                                if param_name is None:
-                                    continue
-
-                                start_pos = (
-                                    outputs.param_start_logits[i, :, unified_idx].argmax().item()
-                                )
-                                end_pos = (
-                                    outputs.param_end_logits[i, :, unified_idx].argmax().item()
-                                )
-
-                                if start_pos < len(token_offsets) and end_pos < len(token_offsets):
-                                    char_start = token_offsets[start_pos][0]
-                                    char_end = token_offsets[end_pos][1]
-                                    arg_value = full_text[char_start:char_end]
-                                    result["tool_args"][param_name] = arg_value
-                                    result["arg_spans"][param_name] = (start_pos, end_pos)
+                # Extract slots and tool args
+                slots, tool_args = gliner2_extractor.extract_all(
+                    text=full_text,
+                    tool_name=tool_name if decision == "tool_call" else None,
+                    tool_params=tool_param_mapping,
+                )
+                result["slots"] = slots
+                result["tool_args"] = tool_args
 
             local_predictions.append((idx, result))
 
@@ -496,16 +504,30 @@ def gather_predictions(
         return []
 
 
+def normalize_value(value: str) -> str:
+    """Normalize value for comparison."""
+    if not value:
+        return ""
+    # Lowercase and strip whitespace
+    return re.sub(r"\s+", " ", value.lower().strip())
+
+
 def compute_metrics(
     predictions: list[dict],
     ground_truths: list[dict],
     samples: list[dict],
     tool_names: list[str],
-    tool_param_mask: dict[str, list[int]],
-    tokenizer: TRMTokenizer,
-    config: TRMConfig,
+    tool_param_mapping: dict[str, list[str]],
 ) -> dict:
-    """Compute evaluation metrics."""
+    """Compute evaluation metrics for TRM + GLiNER2.
+
+    Args:
+        predictions: Model predictions (decision, tool_name, tool_args, slots)
+        ground_truths: Ground truth labels
+        samples: Test samples
+        tool_names: List of tool names
+        tool_param_mapping: Tool name to param list mapping
+    """
     decision_tp = 0
     decision_fp = 0
     decision_fn = 0
@@ -517,8 +539,13 @@ def compute_metrics(
     per_tool_correct = {name: 0 for name in tool_names}
     per_tool_total = {name: 0 for name in tool_names}
 
-    arg_span_correct = 0
-    arg_span_total = 0
+    # Argument extraction metrics
+    arg_exact_match = 0  # Exact string match
+    arg_partial_match = 0  # GT value is substring of pred or vice versa
+    arg_total = 0
+
+    # Per-argument metrics
+    per_arg_stats: dict[str, dict] = {}
 
     for pred, gt, sample in zip(predictions, ground_truths, samples):
         pred_is_tool = pred["decision"] == "tool_call"
@@ -545,41 +572,34 @@ def compute_metrics(
                 if gt_tool in per_tool_correct:
                     per_tool_correct[gt_tool] += 1
 
-            if pred["tool_name"] == gt_tool and gt_tool in tool_param_mask:
-                gt_args = gt["tool_args"]
+            # Compare tool arguments (GLiNER2 extraction)
+            gt_args = gt.get("tool_args", {})
+            pred_args = pred.get("tool_args", {})
 
-                encoded = tokenizer.encode_conversation_with_offsets(
-                    sample["history"],
-                    max_length=config.max_seq_len,
-                )
-                full_text = encoded["full_text"]
-                token_offsets = encoded["offsets"]
+            for arg_name, gt_value in gt_args.items():
+                if not gt_value:
+                    continue
 
-                for arg_name, gt_value in gt_args.items():
-                    if not gt_value:
-                        continue
+                arg_total += 1
 
-                    arg_span_total += 1
+                # Initialize per-arg stats
+                if arg_name not in per_arg_stats:
+                    per_arg_stats[arg_name] = {"exact": 0, "partial": 0, "total": 0}
+                per_arg_stats[arg_name]["total"] += 1
 
-                    gt_value_str = (
-                        str(gt_value) if not isinstance(gt_value, str) else gt_value
-                    )
-                    char_span = find_span_in_text(gt_value_str, full_text)
+                gt_value_str = str(gt_value) if not isinstance(gt_value, str) else gt_value
+                pred_value = pred_args.get(arg_name, "")
 
-                    if char_span is not None:
-                        gt_start = None
-                        gt_end = None
-                        for idx, (cs, ce) in enumerate(token_offsets):
-                            if cs <= char_span[0] < ce:
-                                gt_start = idx
-                            if cs < char_span[1] <= ce:
-                                gt_end = idx
+                gt_norm = normalize_value(gt_value_str)
+                pred_norm = normalize_value(pred_value)
 
-                        if gt_start is not None and gt_end is not None:
-                            if arg_name in pred.get("arg_spans", {}):
-                                pred_start, pred_end = pred["arg_spans"][arg_name]
-                                if pred_start == gt_start and pred_end == gt_end:
-                                    arg_span_correct += 1
+                if gt_norm == pred_norm:
+                    arg_exact_match += 1
+                    per_arg_stats[arg_name]["exact"] += 1
+                elif pred_norm and (gt_norm in pred_norm or pred_norm in gt_norm):
+                    # Only count partial match if prediction is non-empty
+                    arg_partial_match += 1
+                    per_arg_stats[arg_name]["partial"] += 1
 
     metrics = {}
 
@@ -627,10 +647,26 @@ def compute_metrics(
                 "total": per_tool_total[name],
             }
 
-    metrics["arg_span_em"] = (
-        arg_span_correct / arg_span_total if arg_span_total > 0 else 0.0
+    # Argument extraction metrics (GLiNER2)
+    metrics["arg_exact_match"] = (
+        arg_exact_match / arg_total if arg_total > 0 else 0.0
     )
-    metrics["arg_span_samples"] = arg_span_total
+    metrics["arg_partial_match"] = (
+        (arg_exact_match + arg_partial_match) / arg_total if arg_total > 0 else 0.0
+    )
+    metrics["arg_total"] = arg_total
+
+    # Per-argument breakdown
+    metrics["per_arg"] = {}
+    for arg_name, stats in per_arg_stats.items():
+        if stats["total"] > 0:
+            metrics["per_arg"][arg_name] = {
+                "exact_match": stats["exact"] / stats["total"],
+                "partial_match": (stats["exact"] + stats["partial"]) / stats["total"],
+                "exact": stats["exact"],
+                "partial": stats["partial"],
+                "total": stats["total"],
+            }
 
     return metrics
 
@@ -639,83 +675,46 @@ def save_detailed_results(
     samples: list[dict],
     predictions: list[dict],
     output_dir: Path,
-    tokenizer: TRMTokenizer,
-    max_seq_len: int,
     max_samples_per_file: int = 100,
 ) -> None:
     """Save detailed test results to JSON files.
 
     Each JSON file contains up to max_samples_per_file samples with:
     - conversation history
-    - prediction (decision, tool_name, tool_args, ...)
-    - target (decision, tool_name, tool_args, ...)
+    - prediction (decision, tool_name, tool_args, slots)
+    - target (decision, tool_name, tool_args)
 
     Args:
         samples: List of test samples with history and ground_truth
         predictions: List of model predictions
         output_dir: Directory to save JSON files
-        tokenizer: Tokenizer for encoding conversations
-        max_seq_len: Maximum sequence length
         max_samples_per_file: Maximum samples per JSON file (default: 100)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Track extraction stats
-    total_args = 0
-    extractable_args = 0
-
     # Build detailed results
     detailed_results = []
     for idx, (sample, pred) in enumerate(zip(samples, predictions)):
-        # Convert arg_spans tuples to lists for JSON serialization
-        arg_spans = {}
-        for arg_name, span in pred.get("arg_spans", {}).items():
-            arg_spans[arg_name] = list(span) if span else None
-
-        # Check if target args can be extracted from conversation
         target_args = sample["ground_truth"].get("tool_args", {})
-        target_arg_extractable = {}
-        target_arg_spans = {}
+        pred_args = pred.get("tool_args", {})
 
-        if target_args:
-            # Encode conversation to find spans
-            encoded = tokenizer.encode_conversation_with_offsets(
-                sample["history"],
-                max_length=max_seq_len,
-            )
-            full_text = encoded["full_text"]
-            token_offsets = encoded["offsets"]
+        # Compare arguments
+        arg_comparison = {}
+        for arg_name, gt_value in target_args.items():
+            if not gt_value:
+                continue
+            gt_value_str = str(gt_value) if not isinstance(gt_value, str) else gt_value
+            pred_value = pred_args.get(arg_name, "")
 
-            for arg_name, arg_value in target_args.items():
-                if not arg_value:
-                    target_arg_extractable[arg_name] = False
-                    target_arg_spans[arg_name] = None
-                    continue
+            gt_norm = normalize_value(gt_value_str)
+            pred_norm = normalize_value(pred_value)
 
-                arg_value_str = str(arg_value) if not isinstance(arg_value, str) else arg_value
-                char_span = find_span_in_text(arg_value_str, full_text)
-
-                total_args += 1
-                if char_span is not None:
-                    # Find token spans
-                    token_start = None
-                    token_end = None
-                    for tok_idx, (cs, ce) in enumerate(token_offsets):
-                        if cs <= char_span[0] < ce:
-                            token_start = tok_idx
-                        if cs < char_span[1] <= ce:
-                            token_end = tok_idx
-
-                    if token_start is not None and token_end is not None:
-                        target_arg_extractable[arg_name] = True
-                        target_arg_spans[arg_name] = [token_start, token_end]
-                        extractable_args += 1
-                    else:
-                        target_arg_extractable[arg_name] = False
-                        target_arg_spans[arg_name] = None
-                else:
-                    target_arg_extractable[arg_name] = False
-                    target_arg_spans[arg_name] = None
+            arg_comparison[arg_name] = {
+                "target": gt_value_str,
+                "prediction": pred_value,
+                "exact_match": gt_norm == pred_norm,
+                "partial_match": bool(pred_norm) and (gt_norm in pred_norm or pred_norm in gt_norm),
+            }
 
         result = {
             "sample_id": idx,
@@ -726,30 +725,21 @@ def save_detailed_results(
                 "decision": pred["decision"],
                 "decision_prob": pred["decision_prob"],
                 "tool_name": pred["tool_name"],
-                "tool_args": pred["tool_args"],
-                "arg_spans": arg_spans,
+                "tool_args": pred.get("tool_args", {}),
+                "slots": pred.get("slots", {}),
             },
             "target": {
                 "decision": sample["ground_truth"]["decision"],
                 "tool_name": sample["ground_truth"].get("tool_name"),
                 "tool_args": sample["ground_truth"].get("tool_args", {}),
-                "arg_extractable": target_arg_extractable,
-                "arg_spans": target_arg_spans,
             },
             "correct": {
                 "decision": pred["decision"] == sample["ground_truth"]["decision"],
                 "tool_name": pred["tool_name"] == sample["ground_truth"].get("tool_name"),
             },
+            "arg_comparison": arg_comparison,
         }
         detailed_results.append(result)
-
-    # Log extraction stats
-    non_extractable = total_args - extractable_args
-    if total_args > 0:
-        logger.info(
-            f"Target arg extraction: {extractable_args}/{total_args} extractable "
-            f"({non_extractable} args can't be extracted, {non_extractable/total_args*100:.1f}%)"
-        )
 
     # Split into chunks and save
     num_files = (len(detailed_results) + max_samples_per_file - 1) // max_samples_per_file
@@ -769,7 +759,7 @@ def save_detailed_results(
 def print_results(metrics: dict):
     """Print evaluation results using rich tables."""
     main_table = Table(
-        title="Evaluation Results", show_header=True, header_style="bold blue"
+        title="TRM + GLiNER2 Evaluation Results", show_header=True, header_style="bold blue"
     )
     main_table.add_column("Metric", style="bold")
     main_table.add_column("Value", justify="right")
@@ -785,9 +775,15 @@ def print_results(metrics: dict):
         "Tool Accuracy",
         f"{metrics['tool_accuracy']:.4f} ({metrics['tool_samples']} samples)",
     )
+    main_table.add_row("", "")
+    main_table.add_row("[bold]GLiNER2 Extraction[/bold]", "")
     main_table.add_row(
-        "Arg Span EM",
-        f"{metrics['arg_span_em']:.4f} ({metrics['arg_span_samples']} args)",
+        "Arg Exact Match",
+        f"[bold green]{metrics['arg_exact_match']:.4f}[/bold green] ({metrics['arg_total']} args)",
+    )
+    main_table.add_row(
+        "Arg Partial Match",
+        f"{metrics['arg_partial_match']:.4f}",
     )
 
     console.print(main_table)
@@ -833,6 +829,34 @@ def print_results(metrics: dict):
             )
 
         console.print(tool_table)
+
+    # Per-argument extraction accuracy
+    if metrics.get("per_arg"):
+        arg_table = Table(
+            title="Per-Argument Extraction (GLiNER2)", show_header=True, header_style="bold green"
+        )
+        arg_table.add_column("Argument", style="bold")
+        arg_table.add_column("Exact Match", justify="right")
+        arg_table.add_column("Partial Match", justify="right")
+        arg_table.add_column("Samples", justify="right")
+
+        for arg_name, arg_metrics in sorted(metrics["per_arg"].items()):
+            exact = arg_metrics["exact_match"]
+            if exact >= 0.8:
+                exact_str = f"[green]{exact:.4f}[/green]"
+            elif exact >= 0.5:
+                exact_str = f"[yellow]{exact:.4f}[/yellow]"
+            else:
+                exact_str = f"[red]{exact:.4f}[/red]"
+
+            arg_table.add_row(
+                arg_name,
+                exact_str,
+                f"{arg_metrics['partial_match']:.4f}",
+                f"{arg_metrics['exact']}/{arg_metrics['total']}",
+            )
+
+        console.print(arg_table)
 
 
 def main():
@@ -892,6 +916,35 @@ def main():
         help="Remove <think>...</think> tags from assistant responses",
     )
 
+    # Slot fields for GLiNER2 entity extraction
+    parser.add_argument(
+        "--slot-fields",
+        type=str,
+        nargs="+",
+        default=["address", "phone", "device_number", "intent_of_user", "name", "contract_id"],
+        help="Slot field names for GLiNER2 extraction",
+    )
+
+    # GLiNER2 arguments
+    parser.add_argument(
+        "--gliner2-model",
+        type=str,
+        default="fastino/gliner2-multi-v1",
+        help="GLiNER2 base model (default: fastino/gliner2-multi-v1)",
+    )
+    parser.add_argument(
+        "--gliner2-adapter",
+        type=str,
+        default=None,
+        help="Path to GLiNER2 LoRA adapter directory",
+    )
+    parser.add_argument(
+        "--gliner2-threshold",
+        type=float,
+        default=0.5,
+        help="GLiNER2 entity extraction threshold (default: 0.5)",
+    )
+
     args = parser.parse_args()
 
     # Setup distributed or single GPU
@@ -924,16 +977,43 @@ def main():
         tool_names = [t["function"]["name"] for t in tools if "function" in t]
         tool_name_to_id = {name: idx for idx, name in enumerate(sorted(tool_names))}
 
-        # Build unified param mapping (for new architecture)
+        # Build unified param mapping (for GLiNER2 extraction)
+        slot_fields = args.slot_fields
         unified_fields, num_slots, param_name_to_idx, tool_param_mask = build_unified_param_mapping(
-            tools, config.slot_fields
+            tools, slot_fields
         )
         if is_main_process():
+            logger.info(f"Slot fields: {slot_fields}")
             logger.info(f"Unified fields: {len(unified_fields)} ({num_slots} slots + {len(unified_fields) - num_slots} params)")
 
-        # Update config
+        # Build tool -> params mapping for GLiNER2
+        tool_param_mapping: dict[str, list[str]] = {}
+        for tool in tools:
+            if "function" in tool:
+                func = tool["function"]
+                name = func["name"]
+                params = func.get("parameters", {}).get("properties", {})
+                tool_param_mapping[name] = list(params.keys())
+        if is_main_process():
+            logger.info(f"Tool param mapping: {tool_param_mapping}")
+
+        # Initialize GLiNER2 extractor on all ranks for distributed inference
+        if is_main_process():
+            logger.info(f"Loading GLiNER2: {args.gliner2_model}")
+        gliner2_extractor = GLiNER2Extractor(
+            model_name=args.gliner2_model,
+            adapter_path=args.gliner2_adapter,
+            threshold=args.gliner2_threshold,
+            slot_fields=slot_fields,
+            device=str(device),  # Each rank uses its own GPU
+        )
+        if is_main_process():
+            if args.gliner2_adapter:
+                logger.info(f"GLiNER2 adapter loaded: {args.gliner2_adapter}")
+            logger.info(f"GLiNER2 initialized on {world_size} GPU(s)")
+
+        # Update config with tool count
         config.num_tools = len(tool_name_to_id)
-        config.set_tool_param_fields([f for f in unified_fields[num_slots:]])
 
         # Load test data
         with open(args.test_data, "r", encoding="utf-8") as f:
@@ -1008,9 +1088,8 @@ def main():
             samples=samples,
             device=device,
             tool_name_to_id=tool_name_to_id,
-            param_name_to_idx=param_name_to_idx,
-            num_slots=num_slots,
-            tool_param_mask=tool_param_mask,
+            gliner2_extractor=gliner2_extractor,
+            tool_param_mapping=tool_param_mapping,
         )
 
         # Gather predictions from all ranks
@@ -1026,9 +1105,7 @@ def main():
                 ground_truths=ground_truths,
                 samples=samples,
                 tool_names=tool_names,
-                tool_param_mask=tool_param_mask,
-                tokenizer=tokenizer,
-                config=config,
+                tool_param_mapping=tool_param_mapping,
             )
 
             # Print results
@@ -1064,8 +1141,6 @@ def main():
                     samples=samples,
                     predictions=predictions,
                     output_dir=Path(args.output_dir),
-                    tokenizer=tokenizer,
-                    max_seq_len=config.max_seq_len,
                     max_samples_per_file=100,
                 )
 

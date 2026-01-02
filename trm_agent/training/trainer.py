@@ -4,20 +4,21 @@ Implements the training loop with:
 - Deep supervision (N_sup steps)
 - Exponential Moving Average (EMA)
 - Learning rate warmup
-- Unified field extraction (slots + tool params)
+- Gradient accumulation with DDP no_sync optimization
+
+Note: Span extraction (slots/params) is handled by GLiNER2.
+TRM only handles decision classification and tool selection.
 """
 
+from contextlib import nullcontext
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
-if TYPE_CHECKING:
-    from trm_agent.data import TRMTokenizer
 
 from trm_agent.models.config import TRMConfig
 from trm_agent.models.ema import EMA
@@ -32,7 +33,6 @@ from .metrics import (
     compute_final_metrics,
     update_decision_metrics,
     update_tool_metrics,
-    update_unified_field_metrics,
 )
 from .scheduler import get_cosine_warmup_scheduler
 
@@ -40,7 +40,7 @@ logger = get_logger(__name__)
 
 
 class TRMTrainer:
-    """Trainer for TRM with deep supervision and unified field extraction."""
+    """Trainer for TRM with deep supervision."""
 
     def __init__(
         self,
@@ -51,10 +51,6 @@ class TRMTrainer:
         eval_dataloader: Optional[DataLoader] = None,
         device: Optional[torch.device] = None,
         tool_names: Optional[list[str]] = None,
-        unified_fields: Optional[list[str]] = None,
-        num_slots: int = 0,
-        tool_param_mask: Optional[torch.Tensor] = None,
-        tokenizer: Optional["TRMTokenizer"] = None,
     ):
         """Initialize trainer.
 
@@ -66,10 +62,6 @@ class TRMTrainer:
             eval_dataloader: Evaluation data loader (optional)
             device: Device to use
             tool_names: List of tool names for logging
-            unified_fields: List of unified field names (slots + tool_params)
-            num_slots: Number of slot fields (first num_slots in unified_fields)
-            tool_param_mask: [num_tools, num_tool_params] mask tensor
-            tokenizer: Tokenizer for decoding spans (optional)
         """
         self.model = model
         self.config = config
@@ -77,10 +69,6 @@ class TRMTrainer:
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
         self.tool_names = tool_names or []
-        self.unified_fields = unified_fields or config.get_unified_fields()
-        self.num_slots = num_slots or config.num_slots
-        self.num_tool_params = len(self.unified_fields) - self.num_slots
-        self.tokenizer = tokenizer
 
         # Check if model is wrapped with DDP
         self.is_ddp = hasattr(model, "module")
@@ -93,14 +81,8 @@ class TRMTrainer:
         if not self.is_ddp:
             self.model.to(self.device)
 
-        # Store tool_param_mask
-        if tool_param_mask is not None:
-            self.tool_param_mask = tool_param_mask.to(self.device)
-        else:
-            self.tool_param_mask = None
-
         # Loss function
-        self.loss_fn = DeepSupervisionLoss(config, tool_param_mask=self.tool_param_mask)
+        self.loss_fn = DeepSupervisionLoss(config)
 
         # Optimizer
         self.optimizer = AdamW(
@@ -173,9 +155,6 @@ class TRMTrainer:
                 all_outputs,
                 batch["decision_labels"],
                 batch["tool_name_labels"],
-                batch["unified_start_labels"],
-                batch["unified_end_labels"],
-                batch["unified_presence_labels"],
             )
 
         loss = losses["total_loss"] / self.training_config.gradient_accumulation_steps
@@ -187,8 +166,12 @@ class TRMTrainer:
 
         return {k: v.item() for k, v in losses.items()}
 
-    def train_epoch(self) -> dict[str, float]:
-        """Train for one epoch."""
+    def train_epoch(self, progress_bar: Optional[tqdm] = None) -> dict[str, float]:
+        """Train for one epoch.
+
+        Args:
+            progress_bar: Optional global progress bar to update
+        """
         self.model.train()
         total_losses = {}
         num_batches = 0
@@ -197,43 +180,45 @@ class TRMTrainer:
             self.train_dataloader.sampler.set_epoch(self.epoch)
 
         accum_steps = self.training_config.gradient_accumulation_steps
-        total_batches = len(self.train_dataloader)
-        total_opt_steps = total_batches // accum_steps
-
-        progress_bar = tqdm(
-            total=total_opt_steps,
-            desc=f"Epoch {self.epoch + 1}/{self.training_config.num_epochs}",
-            disable=not is_main_process(),
-        )
 
         for step, batch in enumerate(self.train_dataloader):
-            losses = self.train_step(batch)
+            # Use no_sync for intermediate accumulation steps in DDP
+            # This avoids gradient synchronization until the final accumulation step
+            is_accumulating = (step + 1) % accum_steps != 0
+            sync_context = (
+                self.model.no_sync() if (self.is_ddp and is_accumulating) else nullcontext()
+            )
+
+            with sync_context:
+                losses = self.train_step(batch)
 
             for k, v in losses.items():
                 total_losses[k] = total_losses.get(k, 0.0) + v
             num_batches += 1
 
-            if (step + 1) % accum_steps == 0:
+            if not is_accumulating:
                 self._optimizer_step()
                 self.global_step += 1
-                progress_bar.update(1)
 
-                if self.global_step % 10 == 0:
-                    avg_loss = total_losses.get("total_loss", 0) / num_batches
-                    lr = self.scheduler.get_last_lr()[0]
-                    progress_bar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
+                # Update global progress bar
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                    if self.global_step % 10 == 0:
+                        avg_loss = total_losses.get("total_loss", 0) / num_batches
+                        lr = self.scheduler.get_last_lr()[0]
+                        progress_bar.set_postfix(
+                            epoch=f"{self.epoch + 1}/{self.training_config.num_epochs}",
+                            loss=f"{avg_loss:.4f}",
+                            lr=f"{lr:.2e}",
+                        )
 
+                # Step-based checkpoint saving (optional, for long epochs)
                 if (
-                    self.eval_dataloader is not None
-                    and self.global_step % self.training_config.eval_interval == 0
+                    self.training_config.save_interval > 0
+                    and self.global_step % self.training_config.save_interval == 0
                 ):
-                    eval_metrics = self.evaluate()
-                    logger.info(f"Eval metrics: {eval_metrics}")
-
-                if self.global_step % self.training_config.save_interval == 0:
                     self.save_checkpoint()
 
-        progress_bar.close()
         return {k: v / num_batches for k, v in total_losses.items()}
 
     def _optimizer_step(self):
@@ -271,7 +256,7 @@ class TRMTrainer:
 
         # Initialize accumulators
         accum = EvalAccumulators()
-        accum.init_lists(len(self.tool_names), len(self.unified_fields))
+        accum.init_lists(len(self.tool_names))
 
         eval_progress = tqdm(
             self.eval_dataloader,
@@ -300,9 +285,6 @@ class TRMTrainer:
 
             update_decision_metrics(accum, decision_pred, decision_true)
             update_tool_metrics(accum, outputs, batch["tool_name_labels"], len(self.tool_names))
-            update_unified_field_metrics(
-                accum, outputs, batch, self.num_slots, self.tool_param_mask
-            )
 
         if self.ema is not None:
             self.ema.restore()
@@ -310,8 +292,6 @@ class TRMTrainer:
         # Compute final metrics
         metrics = compute_final_metrics(
             accum,
-            self.unified_fields,
-            self.num_slots,
             self.tool_names,
             self.device,
         )
@@ -319,36 +299,62 @@ class TRMTrainer:
         return metrics
 
     def train(self):
-        """Full training loop."""
+        """Full training loop with global step progress bar."""
+        # Calculate total steps and starting point
+        accum_steps = self.training_config.gradient_accumulation_steps
+        steps_per_epoch = len(self.train_dataloader) // accum_steps
+        total_steps = steps_per_epoch * self.training_config.num_epochs
+
+        # Determine starting epoch (for resuming from checkpoint)
+        # If global_step > 0, we're resuming, so start from next epoch
+        start_epoch = self.epoch + 1 if self.global_step > 0 else 0
+
         log_training_start(
             self.training_config.num_epochs,
             str(self.device),
             len(self.train_dataloader.dataset),
             len(self.eval_dataloader.dataset) if self.eval_dataloader else 0,
-            self.unified_fields,
-            self.num_slots,
+            self.tool_names,
         )
 
-        logger.info(f"Starting training for {self.training_config.num_epochs} epochs")
+        if start_epoch > 0:
+            logger.info(
+                f"Resuming training from epoch {start_epoch + 1}/{self.training_config.num_epochs}, "
+                f"step {self.global_step}/{total_steps}"
+            )
+        else:
+            logger.info(
+                f"Starting training: {self.training_config.num_epochs} epochs, "
+                f"{total_steps} total steps ({steps_per_epoch} steps/epoch)"
+            )
 
-        for epoch in range(self.training_config.num_epochs):
+        # Create global progress bar
+        progress_bar = tqdm(
+            total=total_steps,
+            initial=self.global_step,  # Resume from current step
+            desc="Training",
+            disable=not is_main_process(),
+        )
+
+        for epoch in range(start_epoch, self.training_config.num_epochs):
             self.epoch = epoch
 
-            avg_losses = self.train_epoch()
+            avg_losses = self.train_epoch(progress_bar)
             logger.info(f"Epoch {epoch + 1} complete. Avg loss: {avg_losses['total_loss']:.4f}")
 
+            # Epoch-end evaluation
             if self.eval_dataloader is not None:
                 eval_metrics = self.evaluate()
                 log_eval_metrics(
                     epoch + 1,
                     eval_metrics,
-                    self.unified_fields,
-                    self.num_slots,
                     self.tool_names,
                 )
 
+            # Epoch-end checkpoint
             self.save_checkpoint(f"epoch_{epoch + 1}")
 
+        progress_bar.close()
         self.save_model()
         logger.info("Training complete!")
 
@@ -372,9 +378,6 @@ class TRMTrainer:
         if self.ema is not None:
             state["ema_state_dict"] = self.ema.state_dict()
 
-        if self.tool_param_mask is not None:
-            state["tool_param_mask"] = self.tool_param_mask.cpu()
-
         torch.save(state, checkpoint_path)
         self.config.to_yaml(self.output_dir / "config.yaml")
 
@@ -394,10 +397,8 @@ class TRMTrainer:
         if self.ema is not None and "ema_state_dict" in state:
             self.ema.load_state_dict(state["ema_state_dict"])
 
-        if "tool_param_mask" in state:
-            self.tool_param_mask = state["tool_param_mask"].to(self.device)
-
         logger.info(f"Loaded checkpoint: {checkpoint_path}")
+        logger.info(f"  Resumed at epoch {self.epoch + 1}, global_step {self.global_step}")
 
     def save_model(self):
         """Save final model."""
@@ -412,8 +413,5 @@ class TRMTrainer:
             self.ema.restore()
 
         self.config.to_yaml(self.output_dir / "config.yaml")
-
-        if self.tool_param_mask is not None:
-            torch.save(self.tool_param_mask.cpu(), self.output_dir / "tool_param_mask.pt")
 
         logger.info(f"Saved model to {self.output_dir}")

@@ -1,6 +1,9 @@
 """Logging utilities for TRM training.
 
 Provides rich table formatting for evaluation metrics and confusion matrices.
+
+Note: Span extraction (slots/params) metrics are handled by GLiNER2 evaluation.
+TRM only evaluates decision classification and tool selection.
 """
 
 from rich.console import Console
@@ -51,8 +54,6 @@ def _color_accuracy(value: float) -> str:
 def log_eval_metrics(
     epoch: int,
     metrics: dict[str, float],
-    unified_fields: list[str],
-    num_slots: int,
     tool_names: list[str],
 ):
     """Log evaluation metrics using rich tables.
@@ -60,14 +61,10 @@ def log_eval_metrics(
     Args:
         epoch: Current epoch number
         metrics: Dictionary of evaluation metrics
-        unified_fields: List of unified field names
-        num_slots: Number of slot fields
         tool_names: List of tool names
     """
     if not is_main_process():
         return
-
-    num_tool_params = len(unified_fields) - num_slots
 
     # Main metrics table
     main_table = Table(
@@ -100,74 +97,8 @@ def log_eval_metrics(
         "Tool Accuracy",
         f"{metrics.get('tool_accuracy', 0):.4f} ({metrics.get('tool_samples', 0)} samples)"
     )
-    main_table.add_row("", "")
-
-    main_table.add_row(
-        "Slot Presence Acc",
-        f"{metrics.get('slot_presence_accuracy', 0):.4f}"
-    )
-    main_table.add_row(
-        "Slot Span EM",
-        f"{metrics.get('slot_span_exact_match', 0):.4f} ({metrics.get('slot_span_samples', 0)} spans)"
-    )
-    main_table.add_row("", "")
-
-    main_table.add_row(
-        "Param Presence Acc",
-        f"{metrics.get('param_presence_accuracy', 0):.4f}"
-    )
-    main_table.add_row(
-        "Param Span EM",
-        f"{metrics.get('param_span_exact_match', 0):.4f} ({metrics.get('param_span_samples', 0)} spans)"
-    )
 
     console.print(main_table)
-
-    # Per-slot accuracy table
-    if num_slots > 0:
-        slot_table = Table(
-            title="Per-Slot Accuracy",
-            show_header=True,
-            header_style="bold yellow"
-        )
-        slot_table.add_column("Slot Field", style="bold")
-        slot_table.add_column("Presence Acc", justify="right")
-        slot_table.add_column("Span Acc", justify="right")
-
-        for i in range(num_slots):
-            field = unified_fields[i]
-            presence_acc = metrics.get(f"slot_{field}_presence_acc", 0)
-            span_acc = metrics.get(f"slot_{field}_span_acc", 0)
-            slot_table.add_row(
-                field,
-                f"{presence_acc:.4f}",
-                _color_accuracy(span_acc)
-            )
-
-        console.print(slot_table)
-
-    # Per-param accuracy table
-    if num_tool_params > 0:
-        param_table = Table(
-            title="Per-Parameter Accuracy",
-            show_header=True,
-            header_style="bold green"
-        )
-        param_table.add_column("Parameter", style="bold")
-        param_table.add_column("Presence Acc", justify="right")
-        param_table.add_column("Span Acc", justify="right")
-
-        for i in range(num_slots, len(unified_fields)):
-            field = unified_fields[i]
-            presence_acc = metrics.get(f"param_{field}_presence_acc", 0)
-            span_acc = metrics.get(f"param_{field}_span_acc", 0)
-            param_table.add_row(
-                field,
-                f"{presence_acc:.4f}",
-                _color_accuracy(span_acc)
-            )
-
-        console.print(param_table)
 
     # Per-tool accuracy table
     if tool_names:
@@ -206,8 +137,7 @@ def log_training_start(
     device: str,
     train_samples: int,
     eval_samples: int,
-    unified_fields: list[str],
-    num_slots: int,
+    tool_names: list[str],
 ):
     """Log training start information.
 
@@ -216,13 +146,10 @@ def log_training_start(
         device: Training device
         train_samples: Number of training samples
         eval_samples: Number of evaluation samples
-        unified_fields: List of unified field names
-        num_slots: Number of slot fields
+        tool_names: List of tool names
     """
     if not is_main_process():
         return
-
-    num_tool_params = len(unified_fields) - num_slots
 
     table = Table(title="Training Configuration", show_header=True)
     table.add_column("Setting", style="bold")
@@ -232,6 +159,6 @@ def log_training_start(
     table.add_row("Device", device)
     table.add_row("Training Samples", str(train_samples))
     table.add_row("Evaluation Samples", str(eval_samples))
-    table.add_row("Unified Fields", f"{len(unified_fields)} ({num_slots} slots + {num_tool_params} params)")
+    table.add_row("Tools", str(len(tool_names)))
 
     console.print(table)

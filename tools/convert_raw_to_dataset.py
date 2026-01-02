@@ -1,11 +1,16 @@
 """
 Convert raw conversation JSON files to TRM training dataset JSONL format.
 
+Outputs:
+    1. JSONL training file: Contains sub-conversations for TRM training
+    2. Text file: Contains full conversations for tokenizer training (no duplicates)
+
 Usage:
     uv run python tools/convert_raw_to_dataset.py --input <folder> --output <file> [options]
 
 Example:
     uv run python tools/convert_raw_to_dataset.py --input data/raw --output data/dataset.jsonl --tools data/tools.json
+    # Outputs: data/dataset.jsonl (training) + data/dataset_tokenizer.txt (tokenizer)
 
     # With system prompt:
     uv run python tools/convert_raw_to_dataset.py --input data/raw --output data/dataset.jsonl --system prompts/system.txt
@@ -41,6 +46,66 @@ def save_jsonl(samples: list[dict], output_path: Path) -> None:
 def find_json_files(folder: Path) -> list[Path]:
     """Find all JSON files in a folder (non-recursive)."""
     return sorted(folder.glob("*.json"))
+
+
+def extract_text_from_conversation(raw_data: list, tools: list) -> list[str]:
+    """Extract text from a raw conversation for tokenizer training.
+
+    Unlike training samples (which split into sub-conversations),
+    this extracts each conversation once to avoid duplicates.
+
+    Args:
+        raw_data: Raw conversation data (list of turns)
+        tools: Tool definitions
+
+    Returns:
+        List of text lines from this conversation
+    """
+    lines = []
+
+    # Extract tool information (once per conversation)
+    for tool in tools:
+        if "function" in tool:
+            func = tool["function"]
+            if "name" in func:
+                lines.append(func["name"])
+            if "description" in func:
+                lines.append(func["description"])
+            # Extract parameter names and descriptions
+            params = func.get("parameters", {}).get("properties", {})
+            for param_name, param_info in params.items():
+                lines.append(param_name)
+                if "description" in param_info:
+                    lines.append(param_info["description"])
+
+    # Extract text from each turn
+    for turn in raw_data:
+        role = turn.get("role", "")
+        content = turn.get("content", "")
+
+        if isinstance(content, dict):
+            # Extract think trace if present
+            think = content.get("think", "")
+            if think:
+                lines.append(think)
+
+            # Extract response
+            response = content.get("response", "")
+            if isinstance(response, str) and response:
+                lines.append(response)
+            elif isinstance(response, dict):
+                # Tool call response
+                lines.append(json.dumps(response, ensure_ascii=False))
+
+            # Extract slot values
+            for key in ["address", "phone", "device_number", "intent_of_user", "name", "contract_id"]:
+                value = content.get(key, "")
+                if value:
+                    lines.append(str(value))
+        elif isinstance(content, str) and content:
+            lines.append(content)
+
+    return lines
 
 
 def main():
@@ -150,8 +215,12 @@ def main():
 
     # Process files
     all_samples = []
+    all_tokenizer_lines = []  # Text for tokenizer training (no duplicates)
     processed_count = 0
     error_count = 0
+
+    # Add tool info once for tokenizer (not per conversation)
+    tools_added = False
 
     pbar = tqdm(json_files, desc="Processing files", unit="file")
     for json_file in pbar:
@@ -163,13 +232,22 @@ def main():
                 error_count += 1
                 continue
 
+            # Extract training samples (sub-conversations)
             samples = process_raw_conversation(
                 raw_data=raw_data,
                 tools=tools,
                 slot_fields=slot_fields,
             )
-
             all_samples.extend(samples)
+
+            # Extract text for tokenizer (full conversation, no duplicates)
+            tokenizer_lines = extract_text_from_conversation(
+                raw_data=raw_data,
+                tools=tools if not tools_added else [],  # Only add tools once
+            )
+            all_tokenizer_lines.extend(tokenizer_lines)
+            tools_added = True
+
             processed_count += 1
             pbar.set_postfix(samples=len(all_samples), errors=error_count)
 
@@ -182,23 +260,36 @@ def main():
 
     pbar.close()
 
-    # Prepend system prompt to each sample's history
+    # Prepend system prompt to each sample's history and tokenizer text
     if system_prompt:
         system_message = {"role": "system", "content": system_prompt}
         for sample in all_samples:
             sample["history"].insert(0, system_message)
+        # Add system prompt to tokenizer text (once)
+        all_tokenizer_lines.insert(0, system_prompt)
         logger.info(f"Prepended system prompt to {len(all_samples)} samples")
 
     # Create output directory if needed
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Save results
+    # Save training JSONL
     save_jsonl(all_samples, output_file)
+
+    # Save tokenizer text file (same name with _tokenizer.txt suffix)
+    tokenizer_file = output_file.parent / (output_file.stem + "_tokenizer.txt")
+    with open(tokenizer_file, "w", encoding="utf-8") as f:
+        for line in all_tokenizer_lines:
+            # Clean line (remove extra whitespace, ensure single line)
+            clean_line = " ".join(line.split())
+            if clean_line:
+                f.write(clean_line + "\n")
 
     logger.info(
         f"Conversion complete: {processed_count} files, "
-        f"{error_count} errors, {len(all_samples)} samples -> {output_file}"
+        f"{error_count} errors, {len(all_samples)} samples"
     )
+    logger.info(f"  Training file: {output_file}")
+    logger.info(f"  Tokenizer file: {tokenizer_file} ({len(all_tokenizer_lines)} lines)")
 
 
 if __name__ == "__main__":

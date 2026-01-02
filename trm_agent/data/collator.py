@@ -1,7 +1,9 @@
 """Batch collation for TRM training.
 
 Handles padding and batching of variable-length sequences.
-Uses unified field labels (slots + tool params).
+
+Note: Span extraction (slots/params) is handled by GLiNER2, not TRM.
+TRM only handles decision classification and tool selection.
 """
 
 from typing import Any
@@ -13,28 +15,22 @@ class TRMCollator:
     """Collator for TRM tool-calling batches.
 
     Pads sequences to the maximum length in the batch and
-    creates proper attention masks. Uses unified field labels.
+    creates proper attention masks.
     """
 
     def __init__(
         self,
         pad_token_id: int = 0,
         max_seq_len: int = 2048,
-        num_unified_fields: int = 0,
-        max_spans_per_field: int = 4,
     ):
         """Initialize collator.
 
         Args:
             pad_token_id: Token ID for padding
             max_seq_len: Maximum sequence length
-            num_unified_fields: Number of unified fields (slots + tool_params)
-            max_spans_per_field: Maximum number of valid spans per field
         """
         self.pad_token_id = pad_token_id
         self.max_seq_len = max_seq_len
-        self.num_unified_fields = num_unified_fields
-        self.max_spans_per_field = max_spans_per_field
 
     def __call__(self, batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         """Collate a batch of samples.
@@ -64,25 +60,6 @@ class TRMCollator:
         decision_labels = torch.zeros(batch_size, dtype=torch.float)
         tool_name_labels = torch.full((batch_size,), -1, dtype=torch.long)
 
-        # Unified field tensors
-        num_fields = len(batch[0]["unified_start_labels"])
-        unified_start_labels = torch.full((batch_size, num_fields), -1, dtype=torch.long)
-        unified_end_labels = torch.full((batch_size, num_fields), -1, dtype=torch.long)
-        unified_presence_labels = torch.zeros((batch_size, num_fields), dtype=torch.float)
-
-        # Multi-span labels
-        max_spans = batch[0]["unified_all_start_labels"].shape[1]
-        unified_all_start_labels = torch.full(
-            (batch_size, num_fields, max_spans), -1, dtype=torch.long
-        )
-        unified_all_end_labels = torch.full(
-            (batch_size, num_fields, max_spans), -1, dtype=torch.long
-        )
-        unified_span_weights = torch.zeros(
-            (batch_size, num_fields, max_spans), dtype=torch.float
-        )
-        unified_num_spans = torch.zeros((batch_size, num_fields), dtype=torch.long)
-
         # Fill in batch tensors
         for i, sample in enumerate(batch):
             seq_len = min(len(sample["input_ids"]), max_len)
@@ -94,31 +71,12 @@ class TRMCollator:
             decision_labels[i] = sample["decision_label"]
             tool_name_labels[i] = sample["tool_name_label"]
 
-            # Unified field labels
-            unified_start_labels[i] = sample["unified_start_labels"]
-            unified_end_labels[i] = sample["unified_end_labels"]
-            unified_presence_labels[i] = sample["unified_presence_labels"]
-
-            # Multi-span labels
-            unified_all_start_labels[i] = sample["unified_all_start_labels"]
-            unified_all_end_labels[i] = sample["unified_all_end_labels"]
-            unified_span_weights[i] = sample["unified_span_weights"]
-            unified_num_spans[i] = sample["unified_num_spans"]
-
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "role_ids": role_ids,
             "decision_labels": decision_labels,
             "tool_name_labels": tool_name_labels,
-            # Unified field labels
-            "unified_start_labels": unified_start_labels,
-            "unified_end_labels": unified_end_labels,
-            "unified_presence_labels": unified_presence_labels,
-            "unified_all_start_labels": unified_all_start_labels,
-            "unified_all_end_labels": unified_all_end_labels,
-            "unified_span_weights": unified_span_weights,
-            "unified_num_spans": unified_num_spans,
         }
 
 
@@ -129,8 +87,6 @@ def create_dataloader(
     num_workers: int = 0,
     collator: TRMCollator | None = None,
     pad_token_id: int = 0,
-    num_unified_fields: int = 0,
-    max_spans_per_field: int = 4,
     distributed: bool = False,
 ) -> torch.utils.data.DataLoader:
     """Create a DataLoader for TRM training.
@@ -142,19 +98,13 @@ def create_dataloader(
         num_workers: Number of data loading workers
         collator: Custom collator (optional)
         pad_token_id: Padding token ID
-        num_unified_fields: Number of unified fields (slots + tool_params)
-        max_spans_per_field: Maximum spans per field
         distributed: Whether to use DistributedSampler for DDP
 
     Returns:
         DataLoader instance
     """
     if collator is None:
-        collator = TRMCollator(
-            pad_token_id=pad_token_id,
-            num_unified_fields=num_unified_fields,
-            max_spans_per_field=max_spans_per_field,
-        )
+        collator = TRMCollator(pad_token_id=pad_token_id)
 
     sampler = None
     if distributed:

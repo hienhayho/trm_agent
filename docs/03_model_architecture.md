@@ -2,6 +2,8 @@
 
 This document describes the TRM (Tiny Recursive Model) architecture for tool-calling, based on the paper "Less is More: Recursive Reasoning with Tiny Networks".
 
+> **Note:** Span extraction (slots/params) is handled by **GLiNER2**, not TRM. TRM only handles decision classification (tool_call vs direct_answer) and tool selection.
+
 ## Overview
 
 TRM is a recursive reasoning model that uses a **single tiny network** (2 layers, ~7M parameters) to iteratively refine answers through recursive computation.
@@ -37,7 +39,6 @@ flowchart TB
     subgraph Outputs["Output Heads"]
         DecisionHead["DecisionHead<br/>→ decision_logits"]
         ToolHead["ToolHead<br/>→ tool_logits"]
-        UnifiedParamHead["UnifiedParamHead<br/>→ param_start/end/presence"]
         QHead["QHead<br/>→ q_logits"]
     end
 
@@ -56,7 +57,6 @@ flowchart TB
     z_update --> y_update
     y_update --> |"y'"| DecisionHead
     y_update --> |"y'"| ToolHead
-    y_update --> |"y'"| UnifiedParamHead
     y_update --> |"y'"| QHead
 ```
 
@@ -105,11 +105,13 @@ config = TRMConfig(
     T_deep_recursion=3,
     N_supervision=16,
 
+    # URM innovations (enabled by default)
+    use_conv_swiglu=True,
+    conv_kernel_size=2,
+    tbptl_no_grad_steps=2,
+
     # Output dimensions
     num_tools=10,
-
-    # Unified fields (slots + tool params)
-    slot_fields=["address", "phone", "device_number", "name"],
 )
 ```
 
@@ -162,7 +164,6 @@ classDiagram
     class OutputHead {
         +DecisionHead decision_head
         +ToolHead tool_head
-        +UnifiedParamHead unified_param_head
         +ContentHead content_head
         +forward()
     }
@@ -175,7 +176,6 @@ classDiagram
     TRMBlock --> TransformerLayer
     OutputHead --> DecisionHead
     OutputHead --> ToolHead
-    OutputHead --> UnifiedParamHead
 ```
 
 ### 1. Input Embedding
@@ -331,6 +331,8 @@ flowchart TB
 
 ### 4. Output Heads
 
+> **Note:** Span extraction (UnifiedParamHead) has been removed. GLiNER2 now handles entity extraction.
+
 ```mermaid
 flowchart TB
     y["y<br/>[B, L, D]"]
@@ -349,17 +351,6 @@ flowchart TB
             T_MLP["MLP"]
             T_Out["tool_logits<br/>[B, num_tools]"]
         end
-
-        subgraph Unified["UnifiedParamHead"]
-            U_Norm["RMSNorm"]
-            U_Start["start_classifier"]
-            U_End["end_classifier"]
-            U_Pool["Mean Pool"]
-            U_Presence["presence_classifier"]
-            U_Out1["param_start_logits<br/>[B, L, num_unified]"]
-            U_Out2["param_end_logits<br/>[B, L, num_unified]"]
-            U_Out3["param_presence_logits<br/>[B, num_unified]"]
-        end
     end
 
     subgraph QH["QHead"]
@@ -371,10 +362,6 @@ flowchart TB
 
     y --> D_Norm --> D_Pool --> D_MLP --> D_Out
     y --> T_Norm --> T_Pool --> T_MLP --> T_Out
-    y --> U_Norm
-    U_Norm --> U_Start --> U_Out1
-    U_Norm --> U_End --> U_Out2
-    U_Norm --> U_Pool --> U_Presence --> U_Out3
     y --> Q_Norm --> Q_Pool --> Q_MLP --> Q_Out
 ```
 
@@ -394,41 +381,6 @@ Predicts tool name.
 ```python
 # Tool name (classification)
 tool_logits = MLP(y.mean(dim=1))  # [B, num_tools]
-```
-
-#### UnifiedParamHead
-
-Unified extraction for both content slots and tool parameters with decision-based + tool-based masking.
-
-```mermaid
-flowchart TB
-    subgraph Fields["Unified Fields"]
-        Slots["Slot Fields<br/>(always valid)"]
-        Params["Tool Param Fields<br/>(tool-specific mask)"]
-    end
-
-    subgraph Masking["Masking Strategy"]
-        DA["direct_answer:<br/>slots=✓, params=✗"]
-        TC["tool_call:<br/>slots=✓, params=tool-specific"]
-    end
-
-    Slots --> DA
-    Slots --> TC
-    Params --> TC
-```
-
-**Unified Fields:**
-- `unified_fields = slot_fields + tool_param_fields` (deduplicated)
-- Slots are always extracted regardless of decision
-- Tool params are only valid for tool_call with tool-specific masking
-
-```python
-# Span prediction (per token)
-param_start = Linear(y)  # [B, L, num_unified_fields]
-param_end = Linear(y)    # [B, L, num_unified_fields]
-
-# Presence prediction (pooled)
-param_presence = MLP(y.mean(dim=1))  # [B, num_unified_fields]
 ```
 
 #### QHead
@@ -599,52 +551,23 @@ sequenceDiagram
 class TRMOutput:
     decision_logits: Tensor        # [B, 1] - tool_call vs direct_answer
     tool_logits: Tensor            # [B, num_tools] - tool classification
-    param_start_logits: Tensor     # [B, L, num_unified] - param span start
-    param_end_logits: Tensor       # [B, L, num_unified] - param span end
-    param_presence_logits: Tensor  # [B, num_unified] - param presence
     q_logits: Tensor               # [B, 1] - halting probability
     y: Tensor                      # [B, L, D] - final answer embedding
     z: Tensor                      # [B, L, D] - final latent embedding
 ```
 
-## Unified Parameter Extraction
+> **Note:** Span extraction (param_start/end/presence_logits) has been removed. Use GLiNER2 for entity extraction.
 
-The model uses a unified approach for extracting both content slots and tool parameters:
+## Entity Extraction with GLiNER2
 
-```mermaid
-flowchart LR
-    subgraph UnifiedFields["unified_fields"]
-        direction TB
-        S1["address"]
-        S2["phone"]
-        S3["device_number"]
-        S4["name"]
-        P1["product"]
-        P2["reason"]
-        P3["..."]
-    end
+> **Note:** Entity extraction (slots and tool parameters) is now handled by **GLiNER2**, not TRM.
 
-    subgraph Slots["slot_fields<br/>(always valid)"]
-        S1
-        S2
-        S3
-        S4
-    end
+GLiNER2 provides:
+- Named Entity Recognition (NER) for extracting slots and parameters
+- LoRA fine-tuning for domain adaptation
+- Better generalization to unseen entity types
 
-    subgraph Params["tool_param_fields<br/>(tool-specific)"]
-        P1
-        P2
-        P3
-    end
-```
-
-### Masking Example
-
-| Decision | Tool | address | phone | name | product | reason |
-|----------|------|---------|-------|------|---------|--------|
-| direct_answer | - | ✓ | ✓ | ✓ | ✗ | ✗ |
-| tool_call | tool_A | ✓ | ✓ | ✓ | ✓ | ✗ |
-| tool_call | tool_B | ✓ | ✓ | ✓ | ✗ | ✓ |
+See the GLiNER2 documentation for details on entity extraction.
 
 ## Usage Examples
 
@@ -657,11 +580,11 @@ config = TRMConfig(
     hidden_size=512,
     num_layers=2,
     num_tools=15,
-    slot_fields=["address", "phone", "device_number", "name"],
+    # URM innovations (enabled by default)
+    use_conv_swiglu=True,
+    conv_kernel_size=2,
+    tbptl_no_grad_steps=2,
 )
-
-# Set tool param fields (auto-collected from dataset)
-config.set_tool_param_fields(["product", "reason", "quantity"])
 
 model = TRMForToolCalling(config)
 print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -691,9 +614,10 @@ with torch.no_grad():
     )
 
 # Get predictions
-decision = torch.sigmoid(output.decision_logits) > 0.5
-tool_id = output.tool_logits.argmax(dim=-1)
-param_presence = torch.sigmoid(output.param_presence_logits) > 0.5
+decision = torch.sigmoid(output.decision_logits) > 0.5  # tool_call or direct_answer
+tool_id = output.tool_logits.argmax(dim=-1)             # which tool
+
+# For entity extraction, use GLiNER2 separately
 ```
 
 ## Why This Architecture Works
@@ -746,3 +670,429 @@ With default configuration:
 For smaller model (paper's 7M):
 - Reduce hidden_size to 256
 - Reduce vocab_size
+
+## URM Innovations
+
+Based on the Universal Reasoning Model (URM) paper, we integrated two key innovations:
+
+### ConvSwiGLU
+
+Replaces standard SwiGLU with a version that includes depthwise short convolution for local feature mixing.
+
+```mermaid
+flowchart LR
+    x["x"] --> gate_proj["gate_proj"]
+    x --> up_proj["up_proj"]
+    gate_proj --> silu1["SiLU"]
+    silu1 --> mul(("×"))
+    up_proj --> mul
+    mul --> dwconv["DW Conv1D<br/>(k=2)"]
+    dwconv --> silu2["SiLU"]
+    silu2 --> down_proj["down_proj"] --> out["output"]
+```
+
+**Benefits:**
+- +5-8% accuracy improvement on reasoning tasks
+- Enhances local token interactions
+- Minimal parameter overhead
+
+**Configuration:**
+```python
+config = TRMConfig(
+    use_conv_swiglu=True,   # Enable ConvSwiGLU (default: True)
+    conv_kernel_size=2,      # Short conv kernel size (default: 2)
+)
+```
+
+### TBPTL (Truncated Backprop Through Loops)
+
+Skips loss computation on the first K supervision steps during training.
+
+```mermaid
+flowchart TB
+    subgraph Training["Forward Pass with TBPTL"]
+        Step1["Step 0: forward only"]
+        Step2["Step 1: forward only"]
+        Step3["Step 2: compute loss"]
+        Step4["..."]
+        StepN["Step 15: compute loss"]
+    end
+
+    Step1 --> Step2 --> Step3 --> Step4 --> StepN
+```
+
+**Benefits:**
+- ~12% memory reduction
+- ~5% training speedup
+- +2-3% accuracy improvement
+
+**Configuration:**
+```python
+config = TRMConfig(
+    tbptl_no_grad_steps=2,  # Skip loss on first 2 steps (default: 2)
+)
+```
+
+### Combined Impact
+
+| Feature | Memory | Speed | Accuracy Gain |
+|---------|--------|-------|---------------|
+| ConvSwiGLU | ~same | -2% | +5-8% |
+| TBPTL (2 steps) | -12% | +5% | +2-3% |
+| **Combined** | -12% | +3% | **+7-10%** |
+
+### Disabling URM Innovations
+
+To use the original TRM architecture without URM innovations:
+
+```python
+config = TRMConfig(
+    use_conv_swiglu=False,     # Use standard SwiGLU
+    tbptl_no_grad_steps=0,     # No TBPTL (compute loss on all steps)
+)
+```
+
+## TRM Recursive Loop Option
+
+By default, TRM uses its characteristic recursive reasoning loop with latent recursion and deep supervision. However, when using hybrid architecture with Mamba, you can optionally disable the TRM loop and let Mamba's state space handle recurrence internally.
+
+### Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `use_trm_loop` | `True` | Enable TRM recursive reasoning loop |
+
+### Forward Pass Modes
+
+#### With TRM Loop (default)
+
+```mermaid
+flowchart TB
+    subgraph TRMLoop["TRM Recursive Loop (use_trm_loop=True)"]
+        Init["x = embed(input)<br/>y = y_init, z = z_init"]
+
+        subgraph Supervision["for step in range(N_sup):"]
+            subgraph DeepRec["Deep Recursion (T times)"]
+                subgraph LatentRec["Latent Recursion (n times)"]
+                    Z["z = net(x + y + z)"]
+                end
+                Y["y = net(y + z)"]
+            end
+            Output["outputs = output_head(y)"]
+        end
+    end
+
+    Init --> Supervision
+```
+
+**Characteristics:**
+- Full TRM recursive reasoning algorithm
+- Latent recursion (n=6 iterations)
+- Deep recursion (T=3 iterations)
+- Deep supervision (N_sup=16 steps)
+- More computationally expensive
+- Better for complex reasoning tasks
+
+#### Without TRM Loop (single-pass mode)
+
+```mermaid
+flowchart LR
+    subgraph SinglePass["Single Pass Mode (use_trm_loop=False)"]
+        Input["input_ids"] --> Embed["InputEmbedding"]
+        Embed --> Net["TRMBlock<br/>(Mamba handles<br/>recurrence)"]
+        Net --> Heads["OutputHead<br/>QHead"]
+    end
+```
+
+**Characteristics:**
+- Single forward pass through the network
+- Mamba's state space handles sequential dependencies internally
+- Faster training and inference
+- Lower memory usage
+- Better suited when using hybrid Mamba architecture
+
+### Usage
+
+#### Python Configuration
+
+```python
+from trm_agent.models import TRMConfig, TRMForToolCalling
+
+# With TRM loop (default)
+config_with_loop = TRMConfig(
+    use_trm_loop=True,  # Default
+    n_latent_recursion=6,
+    T_deep_recursion=3,
+    N_supervision=16,
+)
+
+# Without TRM loop (single-pass, Mamba handles recurrence)
+config_single_pass = TRMConfig(
+    use_trm_loop=False,
+    use_hybrid_block=True,  # Typically used with Mamba
+)
+```
+
+#### CLI Flag
+
+```bash
+# Default: TRM loop enabled
+uv run python tools/train.py \
+    --config configs/default.yaml \
+    --train-data data/train.jsonl
+
+# Disable TRM loop (single-pass mode)
+uv run python tools/train.py \
+    --config configs/default.yaml \
+    --train-data data/train.jsonl \
+    --no-trm-loop \
+    --use-hybrid
+```
+
+### When to Use Each Mode
+
+| Scenario | Recommendation |
+|----------|----------------|
+| Standard TRM training | `use_trm_loop=True` (default) |
+| Hybrid Mamba + fast training | `use_trm_loop=False` |
+| Complex multi-step reasoning | `use_trm_loop=True` |
+| Simple tool classification | `use_trm_loop=False` |
+| Memory constrained | `use_trm_loop=False` |
+| Maximum accuracy | `use_trm_loop=True` |
+
+### Implementation Details
+
+When `use_trm_loop=False`:
+- `_forward_single_pass()` is used instead of `_forward_with_trm_loop()`
+- Input is embedded and passed through TRMBlock once
+- Output heads receive the hidden state directly
+- `y` and `z` outputs are both set to the hidden state (no separate latent)
+- Training returns single output (wrapped in list for compatibility)
+
+## Hybrid Architecture (Mamba + MoE + Attention)
+
+The hybrid architecture replaces standard TransformerLayers with HybridBlocks that combine three complementary processing mechanisms.
+
+### Overview
+
+```
+              HybridBlock (per layer)
+┌─────────────────────────────────────────────────┐
+│  Input                                          │
+│    │                                            │
+│    ▼                                            │
+│  RMSNorm → Mamba → + Residual                   │  O(n) sequential
+│    │                                            │
+│    ▼                                            │
+│  RMSNorm → MoE (4 experts, top-2) → + Residual  │  Sparse capacity
+│    │                                            │
+│    ▼                                            │
+│  RMSNorm → MultiHead Attention → + Residual     │  O(n²) global
+│    │                                            │
+│    ▼                                            │
+│  Output                                         │
+└─────────────────────────────────────────────────┘
+```
+
+### Components
+
+#### 1. MambaLayer
+
+Selective State Space Model for efficient sequential processing. Supports both Mamba1 and Mamba2.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `mamba_version` | 2 | Mamba version: 1 or 2 |
+| `mamba_d_state` | 16 | SSM state dimension (Mamba1 only) |
+| `mamba_d_conv` | 4 | Local convolution width |
+| `mamba_expand` | 2 | Block expansion factor |
+| `mamba_headdim` | 64 | Head dimension (Mamba2 only) |
+
+**Mamba1 vs Mamba2:**
+
+| Feature | Mamba1 | Mamba2 |
+|---------|--------|--------|
+| Algorithm | Selective SSM | SSD (State Space Duality) |
+| Key param | `d_state` | `headdim` |
+| Performance | Good | Better (+10-20% speed) |
+| Memory | Higher | Lower |
+
+**Benefits:**
+- O(n) complexity vs O(n²) for attention
+- Efficient long-range dependency modeling
+- Hardware-efficient implementation
+- Mamba2 offers improved speed and memory efficiency
+
+**Requirements for CUDA Kernels:**
+
+| Package | Version | Notes |
+|---------|---------|-------|
+| Python | 3.10 | Recommended |
+| PyTorch | 2.1.1+ | Must match CUDA version |
+| CUDA | 11.8+ | 11.8 or 12.x |
+| mamba-ssm | 2.0.3+ | With causal-conv1d |
+| causal-conv1d | 1.5.0+ | Required for fast kernels |
+| numpy | <2.0 | Avoid numpy 2.x |
+
+**Installation:**
+```bash
+# Install with CUDA kernels
+pip install causal-conv1d>=1.5.0
+pip install mamba-ssm>=2.0.3
+
+# Or via project extras
+uv add "trm-agent[mamba]"
+```
+
+**Troubleshooting:**
+- If training hangs, use `--no-mamba-cuda-kernels` to disable CUDA kernels
+- If still failing, use `--mamba-version 1` to use Mamba1 instead
+- Ensure `chunk_size` is power of 2 (default: 256)
+
+#### 2. MoELayer (Mixture of Experts)
+
+Sparse expert routing for capacity scaling without proportional compute increase.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `num_experts` | 4 | Number of expert MLPs |
+| `num_experts_per_tok` | 2 | Top-k experts per token |
+| `moe_intermediate_size` | 1024 | Expert MLP hidden size |
+
+```mermaid
+flowchart TB
+    x["x [B, L, D]"] --> Router["Router<br/>Linear(D, num_experts)"]
+    Router --> TopK["Top-K Selection<br/>(k=2)"]
+    TopK --> Softmax["Softmax Weights"]
+
+    subgraph Experts["Expert MLPs"]
+        E1["Expert 0<br/>SwiGLU"]
+        E2["Expert 1<br/>SwiGLU"]
+        E3["Expert 2<br/>SwiGLU"]
+        E4["Expert 3<br/>SwiGLU"]
+    end
+
+    x --> E1 & E2 & E3 & E4
+    Softmax --> Combine["Weighted Sum"]
+    E1 & E2 & E3 & E4 --> Combine
+    Combine --> out["output [B, L, D]"]
+```
+
+#### 3. MultiHeadAttention
+
+Standard attention for global context aggregation (same as TransformerLayer).
+
+### Configuration
+
+```python
+from trm_agent.models import TRMConfig
+
+# Using Mamba2 (default, recommended)
+config = TRMConfig(
+    # Enable hybrid architecture
+    use_hybrid_block=True,
+
+    # Mamba2 configuration (default)
+    mamba_version=2,
+    mamba_headdim=64,
+    mamba_d_conv=4,
+    mamba_expand=2,
+
+    # MoE configuration
+    num_experts=4,
+    num_experts_per_tok=2,
+    moe_intermediate_size=1024,
+)
+
+# Using Mamba1 (legacy)
+config_mamba1 = TRMConfig(
+    use_hybrid_block=True,
+    mamba_version=1,
+    mamba_d_state=16,
+    mamba_d_conv=4,
+    mamba_expand=2,
+)
+```
+
+### CLI Usage
+
+```bash
+# Install mamba support
+uv add "trm-agent[mamba]"
+
+# Train with hybrid architecture (Mamba2 by default)
+uv run python tools/train.py \
+    --config configs/default.yaml \
+    --train-data data/train.jsonl \
+    --use-hybrid \
+    --num-experts 4 \
+    --experts-per-token 2 \
+    --output-dir outputs/
+
+# Use Mamba1 instead
+uv run python tools/train.py \
+    --config configs/default.yaml \
+    --train-data data/train.jsonl \
+    --use-hybrid \
+    --mamba-version 1 \
+    --output-dir outputs/
+```
+
+### Architecture Comparison
+
+| Component | Standard TRMBlock | Hybrid TRMBlock |
+|-----------|-------------------|-----------------|
+| Layer type | TransformerLayer | HybridBlock |
+| Sequential | Attention + MLP | Mamba |
+| Sparse | - | MoE (4 experts) |
+| Global | Attention | Attention |
+| Complexity | O(n²) | O(n) + O(n) + O(n²) |
+
+### TRM Compatibility
+
+The hybrid architecture **fully preserves TRM's recursive reasoning algorithm**:
+
+1. **Latent recursion** (`z = net(x + y + z)`) unchanged
+2. **Answer refinement** (`y = net(y + z)`) unchanged
+3. **Deep recursion** (T iterations) unchanged
+4. **Deep supervision** (N_sup steps) unchanged
+
+Only the internal "net" implementation changes from TransformerLayer to HybridBlock. The recursive reasoning pattern remains identical.
+
+```
+TRM Algorithm (unchanged):
+┌─────────────────────────────────────────┐
+│  for step in range(N_sup):              │
+│      for t in range(T):                 │
+│          for i in range(n):             │
+│              z = net(x + y + z)  ←──────│── HybridBlock or TransformerLayer
+│          y = net(y + z)          ←──────│── HybridBlock or TransformerLayer
+│      outputs = output_head(y)           │
+│      q = q_head(y)                      │
+└─────────────────────────────────────────┘
+```
+
+### When to Use Hybrid
+
+| Scenario | Recommendation |
+|----------|----------------|
+| Short sequences (<512 tokens) | Standard Transformer |
+| Long sequences (>1024 tokens) | Hybrid (Mamba benefits) |
+| Memory constrained | Hybrid (sparse MoE) |
+| Maximum accuracy | Hybrid + more experts |
+| Fastest training | Standard Transformer |
+
+### Fallback Behavior
+
+If `mamba-ssm` is not installed but `use_hybrid_block=True`:
+- Model initialization raises `ImportError`
+- For Mamba2: "Mamba2 is required but not available. Install with: pip install 'mamba-ssm[causal-conv1d]>=2.0'"
+- For Mamba1: "mamba-ssm is required for MambaLayer"
+
+To check availability:
+```python
+from trm_agent.models.layers import MAMBA_AVAILABLE, MAMBA2_AVAILABLE
+
+print(f"Mamba1 available: {MAMBA_AVAILABLE}")
+print(f"Mamba2 available: {MAMBA2_AVAILABLE}")
+```
