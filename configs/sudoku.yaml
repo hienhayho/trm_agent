@@ -1,0 +1,77 @@
+# TRM Sudoku Configuration
+# Based on the paper "Less is More: Recursive Reasoning with Tiny Networks"
+
+model:
+  # Grid configuration
+  grid_size: 9
+  seq_len: 81  # 9x9
+  vocab_size: 11  # PAD + 10 values (empty + 1-9)
+
+  # Architecture
+  hidden_size: 512 
+  num_layers: 2  # Paper finding: 2 layers is optimal
+  num_heads: 8
+  intermediate_size: 1024
+  dropout: 0.1
+  use_attention: true
+
+  # TRM recursion
+  use_trm_loop: true
+  n_latent_recursion: 6  # n: latent reasoning iterations
+  T_deep_recursion: 3    # T: deep recursion iterations
+  N_supervision: 2       # N_sup: supervision steps
+
+  # URM innovations
+  use_conv_swiglu: true
+  conv_kernel_size: 2
+  tbptl_no_grad_steps: 2
+
+  # Hybrid architecture (Mamba + MoE + Attention)
+  use_hybrid_block: true
+
+  # Mamba configuration
+  mamba_version: 1
+  mamba_d_state: 16
+  mamba_d_conv: 4
+  mamba_expand: 2
+  mamba_headdim: 64
+  mamba_chunk_size: 256
+  mamba_use_mem_eff_path: true
+
+  # MoE configuration (DeepSeek-V3 style)
+  moe_num_shared_experts: 1       # Shared experts (always active)
+  moe_num_routed_experts: 8       # Routed experts (top-k selection)
+  moe_top_k: 2                    # Select top-2 from routed
+  moe_intermediate_size: 512      # Expert FFN size
+  moe_use_sigmoid_gating: true    # Sigmoid (not softmax)
+  moe_bias_update_speed: 0.001    # Load balancing bias update
+  moe_seq_aux_loss_weight: 0.0    # Disabled (aux-loss-free)
+
+  # Token IDs
+  pad_token_id: 0
+  ignore_label_id: 0
+
+training:
+  # Optimizer
+  learning_rate: 1.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+
+  # Scheduler
+  warmup_steps: 1000
+  num_epochs: 100
+
+  # Batch size
+  batch_size: 64
+
+  # AMP
+  use_amp: true
+
+  # EMA
+  use_ema: true
+  ema_decay: 0.999
+
+  # Checkpointing
+  save_interval: 10
