@@ -15,10 +15,8 @@ outputs/
 checkpoints/
 
 # Large data files
-data/*.jsonl
-data/*.json
+/data/
 !data/tools.json
-data/*.txt
 !data/system_prompts.txt
 data_sale.json
 .chainlit

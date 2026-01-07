@@ -18,7 +18,7 @@ model:
   pad_token_id: 0
 
   # TRM specific
-  use_trm_loop: false     # Use TRM recursive loop (false = single pass, let Mamba handle recurrence)
+  use_trm_loop: true     # Use TRM recursive loop (false = single pass, let Mamba handle recurrence)
   n_latent_recursion: 6  # n: latent reasoning iterations
   T_deep_recursion: 3    # T: deep recursion iterations
   N_supervision: 2       # N_sup: max supervision steps
@@ -40,10 +40,14 @@ model:
   mamba_chunk_size: 256   # Chunk size for Mamba2 (must be power of 2)
   mamba_use_mem_eff_path: true  # Use optimized CUDA kernels (set false if training hangs)
 
-  # MoE configuration (only used when use_hybrid_block=true)
-  num_experts: 4          # Number of expert MLPs
-  num_experts_per_tok: 2  # Top-k experts per token
-  moe_intermediate_size: 1024  # Expert MLP hidden size
+  # MoE configuration (DeepSeek-V3 style, only used when use_hybrid_block=true)
+  moe_num_shared_experts: 1       # Shared experts (always active)
+  moe_num_routed_experts: 8       # Routed experts (top-k selection)
+  moe_top_k: 2                    # Top-k experts per token
+  moe_intermediate_size: 1024     # Expert MLP hidden size
+  moe_use_sigmoid_gating: true    # Sigmoid vs softmax gating
+  moe_bias_update_speed: 0.001    # Bias update rate for load balancing
+  moe_seq_aux_loss_weight: 0.0    # Sequence-wise aux loss (0 = disabled)
 
   # Output dimensions
   num_tools: 10

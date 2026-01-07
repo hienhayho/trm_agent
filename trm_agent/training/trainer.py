@@ -32,6 +32,7 @@ from .metrics import (
     EvalAccumulators,
     compute_final_metrics,
     update_decision_metrics,
+    update_intent_metrics,
     update_tool_metrics,
 )
 from .scheduler import get_cosine_warmup_scheduler
@@ -51,6 +52,7 @@ class TRMTrainer:
         eval_dataloader: Optional[DataLoader] = None,
         device: Optional[torch.device] = None,
         tool_names: Optional[list[str]] = None,
+        intent_names: Optional[list[str]] = None,
     ):
         """Initialize trainer.
 
@@ -62,6 +64,7 @@ class TRMTrainer:
             eval_dataloader: Evaluation data loader (optional)
             device: Device to use
             tool_names: List of tool names for logging
+            intent_names: List of intent names for logging
         """
         self.model = model
         self.config = config
@@ -69,6 +72,7 @@ class TRMTrainer:
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
         self.tool_names = tool_names or []
+        self.intent_names = intent_names or []
 
         # Check if model is wrapped with DDP
         self.is_ddp = hasattr(model, "module")
@@ -151,10 +155,14 @@ class TRMTrainer:
                 return_all_steps=True,
             )
 
+            # Get intent labels if available
+            intent_labels = batch.get("intent_labels")
+
             losses = self.loss_fn(
                 all_outputs,
                 batch["decision_labels"],
                 batch["tool_name_labels"],
+                intent_labels,
             )
 
         loss = losses["total_loss"] / self.training_config.gradient_accumulation_steps
@@ -256,7 +264,7 @@ class TRMTrainer:
 
         # Initialize accumulators
         accum = EvalAccumulators()
-        accum.init_lists(len(self.tool_names))
+        accum.init_lists(len(self.tool_names), len(self.intent_names))
 
         eval_progress = tqdm(
             self.eval_dataloader,
@@ -286,6 +294,12 @@ class TRMTrainer:
             update_decision_metrics(accum, decision_pred, decision_true)
             update_tool_metrics(accum, outputs, batch["tool_name_labels"], len(self.tool_names))
 
+            # Intent metrics
+            if self.intent_names and "intent_labels" in batch:
+                update_intent_metrics(
+                    accum, outputs, batch["intent_labels"], len(self.intent_names)
+                )
+
         if self.ema is not None:
             self.ema.restore()
 
@@ -294,6 +308,7 @@ class TRMTrainer:
             accum,
             self.tool_names,
             self.device,
+            self.intent_names,
         )
 
         return metrics
@@ -349,6 +364,7 @@ class TRMTrainer:
                     epoch + 1,
                     eval_metrics,
                     self.tool_names,
+                    self.intent_names,
                 )
 
             # Epoch-end checkpoint

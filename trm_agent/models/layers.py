@@ -415,62 +415,164 @@ class Expert(nn.Module):
 
 
 class MoELayer(nn.Module):
-    """Mixture of Experts layer with top-k routing.
+    """DeepSeek-V3 style Mixture of Experts with auxiliary-loss-free load balancing.
 
-    Routes each token to top-k experts based on learned router weights.
-    Provides sparse scaling: more capacity without proportional compute.
+    Key innovations:
+    - Shared experts (always active) + Routed experts (top-k selection)
+    - Sigmoid gating instead of softmax
+    - Dynamic bias for load balancing (no auxiliary loss needed)
+    - Optional sequence-wise auxiliary loss for extreme imbalance prevention
     """
 
     def __init__(self, config: TRMConfig):
         super().__init__()
-        self.num_experts = config.num_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
         self.hidden_size = config.hidden_size
 
-        # Router: projects hidden_size -> num_experts
-        self.router = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        # Shared experts (always active, process ALL tokens)
+        self.num_shared_experts = config.moe_num_shared_experts
+        self.shared_experts = nn.ModuleList([
+            Expert(config.hidden_size, config.moe_intermediate_size)
+            for _ in range(self.num_shared_experts)
+        ])
 
-        # Expert MLPs
-        self.experts = nn.ModuleList(
-            [
-                Expert(config.hidden_size, config.moe_intermediate_size)
-                for _ in range(config.num_experts)
-            ]
-        )
+        # Routed experts (top-k selection)
+        self.num_routed_experts = config.moe_num_routed_experts
+        self.routed_experts = nn.ModuleList([
+            Expert(config.hidden_size, config.moe_intermediate_size)
+            for _ in range(self.num_routed_experts)
+        ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Route tokens to top-k experts and combine outputs."""
-        batch_size, seq_len, hidden_size = x.shape
+        # Router: projects hidden_size -> num_routed_experts
+        self.router = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
 
-        # Flatten for routing: [B*L, D]
-        x_flat = x.view(-1, hidden_size)
+        # Dynamic bias for load balancing (not trained by gradient)
+        self.register_buffer("expert_bias", torch.zeros(self.num_routed_experts))
 
-        # Compute router logits and select top-k experts
-        router_logits = self.router(x_flat)  # [B*L, num_experts]
-        router_weights, selected_experts = torch.topk(
-            router_logits, self.num_experts_per_tok, dim=-1
-        )
-        router_weights = F.softmax(router_weights, dim=-1)  # [B*L, k]
+        # Config
+        self.top_k = config.moe_top_k
+        self.bias_update_speed = config.moe_bias_update_speed
+        self.use_sigmoid_gating = config.moe_use_sigmoid_gating
+        self.seq_aux_loss_weight = config.moe_seq_aux_loss_weight
 
-        # Compute expert outputs
+    def _compute_routed_output(
+        self,
+        x_flat: torch.Tensor,
+        topk_gates: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute weighted sum of routed expert outputs."""
         output = torch.zeros_like(x_flat)
 
-        for i, expert in enumerate(self.experts):
+        for i, expert in enumerate(self.routed_experts):
             # Find tokens routed to this expert
-            expert_mask = (selected_experts == i).any(dim=-1)  # [B*L]
+            expert_mask = (topk_indices == i).any(dim=-1)  # [B*L]
             if expert_mask.any():
                 expert_input = x_flat[expert_mask]
                 expert_output = expert(expert_input)
 
                 # Get weights for this expert
-                weight_idx = (selected_experts == i).float()  # [B*L, k]
-                weights = (router_weights * weight_idx).sum(dim=-1)  # [B*L]
+                weight_idx = (topk_indices == i).float()  # [B*L, k]
+                weights = (topk_gates * weight_idx).sum(dim=-1)  # [B*L]
 
-                output[expert_mask] += (
-                    weights[expert_mask].unsqueeze(-1) * expert_output
-                )
+                output[expert_mask] += weights[expert_mask].unsqueeze(-1) * expert_output
 
-        return output.view(batch_size, seq_len, hidden_size)
+        return output
+
+    @torch.no_grad()
+    def _update_expert_bias(self, selected_experts: torch.Tensor):
+        """Update bias to balance expert load without auxiliary loss (P-controller)."""
+        # Count tokens per expert
+        expert_counts = torch.zeros(
+            self.num_routed_experts, device=selected_experts.device
+        )
+        for i in range(self.num_routed_experts):
+            expert_counts[i] = (selected_experts == i).sum()
+
+        # Target: uniform distribution
+        total_selections = selected_experts.numel()
+        target_count = total_selections / self.num_routed_experts
+
+        # P-controller: overloaded → decrease bias, underutilized → increase bias
+        bias_update = self.bias_update_speed * (target_count - expert_counts)
+        self.expert_bias.add_(bias_update)
+
+    def _compute_seq_aux_loss(
+        self,
+        router_logits: torch.Tensor,
+        selected_experts: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Compute per-sequence auxiliary loss for extreme imbalance prevention."""
+        batch_size = router_logits.shape[0] // seq_len
+        router_logits = router_logits.view(batch_size, seq_len, -1)
+        selected_experts = selected_experts.view(batch_size, seq_len, -1)
+
+        total_loss = torch.tensor(0.0, device=router_logits.device)
+
+        for b in range(batch_size):
+            seq_logits = router_logits[b]  # [L, num_routed_experts]
+            seq_selected = selected_experts[b]  # [L, top_k]
+
+            # Probability distribution
+            probs = F.softmax(seq_logits, dim=-1).mean(dim=0)  # [num_routed_experts]
+
+            # Frequency of selection
+            freq = torch.zeros(self.num_routed_experts, device=seq_logits.device)
+            for i in range(self.num_routed_experts):
+                freq[i] = (seq_selected == i).float().mean()
+
+            # Loss: encourage uniform distribution
+            total_loss = total_loss + (probs * freq).sum() * self.num_routed_experts
+
+        return total_loss / batch_size * self.seq_aux_loss_weight
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with shared + routed experts.
+
+        Returns:
+            output: [B, L, D] - MoE output
+            aux_loss: scalar - auxiliary loss (0 if disabled)
+        """
+        batch_size, seq_len, hidden_size = x.shape
+        x_flat = x.view(-1, hidden_size)
+
+        # 1. Shared experts (process ALL tokens)
+        shared_output = torch.zeros_like(x_flat)
+        for expert in self.shared_experts:
+            shared_output = shared_output + expert(x_flat)
+
+        # 2. Router scores with dynamic bias
+        router_logits = self.router(x_flat)  # [B*L, num_routed_experts]
+        scores_with_bias = router_logits + self.expert_bias
+
+        # 3. Gating (sigmoid vs softmax)
+        if self.use_sigmoid_gating:
+            gates = torch.sigmoid(scores_with_bias)
+        else:
+            gates = F.softmax(scores_with_bias, dim=-1)
+
+        # 4. Top-k selection
+        topk_gates, topk_indices = torch.topk(gates, self.top_k, dim=-1)
+
+        # 5. Normalize gates
+        topk_gates = topk_gates / (topk_gates.sum(dim=-1, keepdim=True) + 1e-9)
+
+        # 6. Compute routed expert outputs
+        routed_output = self._compute_routed_output(x_flat, topk_gates, topk_indices)
+
+        # 7. Update bias (training only, no gradients)
+        if self.training:
+            self._update_expert_bias(topk_indices)
+
+        # 8. Combine outputs: shared + routed
+        output = shared_output + routed_output
+
+        # 9. Optional sequence-wise auxiliary loss
+        aux_loss = torch.tensor(0.0, device=x.device)
+        if self.seq_aux_loss_weight > 0 and self.training:
+            aux_loss = self._compute_seq_aux_loss(router_logits, topk_indices, seq_len)
+
+        return output.view(batch_size, seq_len, hidden_size), aux_loss
 
 
 class HybridBlock(nn.Module):
@@ -478,7 +580,7 @@ class HybridBlock(nn.Module):
 
     Combines three architectures for optimal performance:
     1. Mamba: O(n) efficient sequential processing
-    2. MoE: Sparse capacity scaling
+    2. MoE: Sparse capacity scaling (DeepSeek-V3 style with shared + routed experts)
     3. Attention: O(n²) global context
 
     Each sublayer uses pre-norm with residual connection.
@@ -492,7 +594,7 @@ class HybridBlock(nn.Module):
         self.mamba_norm = RMSNorm(config.hidden_size)
         self.mamba = MambaLayer(config)
 
-        # MoE layer (sparse capacity)
+        # MoE layer (DeepSeek-V3 style: shared + routed experts)
         self.moe_norm = RMSNorm(config.hidden_size)
         self.moe = MoELayer(config)
 
@@ -504,18 +606,23 @@ class HybridBlock(nn.Module):
 
     def forward(
         self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Apply Mamba -> MoE -> Attention with residuals."""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply Mamba -> MoE -> Attention with residuals.
+
+        Returns:
+            output: [B, L, D] - block output
+            aux_loss: scalar - MoE auxiliary loss (0 if disabled)
+        """
         # Mamba: O(n) sequential processing
         residual = x
         x = self.mamba_norm(x)
         x = self.mamba(x)
         x = self.dropout(x) + residual
 
-        # MoE: sparse expert routing
+        # MoE: sparse expert routing (returns aux_loss)
         residual = x
         x = self.moe_norm(x)
-        x = self.moe(x)
+        x, aux_loss = self.moe(x)
         x = self.dropout(x) + residual
 
         # Attention: O(n²) global context
@@ -524,7 +631,7 @@ class HybridBlock(nn.Module):
         x = self.attn(x, attention_mask)
         x = self.dropout(x) + residual
 
-        return x
+        return x, aux_loss
 
 
 class TRMBlock(nn.Module):
@@ -541,6 +648,7 @@ class TRMBlock(nn.Module):
     def __init__(self, config: TRMConfig):
         super().__init__()
         self.config = config
+        self.use_hybrid_block = config.use_hybrid_block
 
         # Choose block type based on config
         if config.use_hybrid_block:
@@ -561,8 +669,20 @@ class TRMBlock(nn.Module):
         self,
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Apply TRM block."""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply TRM block.
+
+        Returns:
+            output: [B, L, D] - block output
+            aux_loss: scalar - aggregated MoE auxiliary loss (0 if not using hybrid)
+        """
+        total_aux_loss = torch.tensor(0.0, device=x.device)
+
         for layer in self.layers:
-            x = layer(x, attention_mask)
-        return self.final_norm(x)
+            if self.use_hybrid_block:
+                x, aux_loss = layer(x, attention_mask)
+                total_aux_loss = total_aux_loss + aux_loss
+            else:
+                x = layer(x, attention_mask)
+
+        return self.final_norm(x), total_aux_loss

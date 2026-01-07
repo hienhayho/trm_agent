@@ -31,6 +31,13 @@ Example:
         --train-data data/train.jsonl \
         --output-dir outputs/
 
+    # With intent prediction training:
+    uv run python tools/train.py \
+        --config configs/default.yaml \
+        --train-data data/train.jsonl \
+        --intent-map data/intend.json \
+        --output-dir outputs/
+
     # Distributed training with torchrun:
     torchrun --standalone --nproc_per_node=2 tools/train.py \
         --config configs/default.yaml \
@@ -48,7 +55,7 @@ import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import ConcatDataset, random_split
 
-from trm_agent.data import TRMTokenizer, TRMToolCallingDataset
+from trm_agent.data import TRMTokenizer, TRMToolCallingDataset, load_intent_mapping
 from trm_agent.data.collator import create_dataloader
 from trm_agent.models import TRMConfig, TRMForToolCalling
 from trm_agent.training import TRMTrainer
@@ -121,11 +128,16 @@ def extract_text_for_tokenizer(
                     if content:
                         f_out.write(content + "\n")
 
-                    # Extract slot values
+                    # Extract slot values (can be dict or list)
                     slots = sample.get("slots", {})
-                    for value in slots.values():
-                        if value:
-                            f_out.write(str(value) + "\n")
+                    if isinstance(slots, dict):
+                        for value in slots.values():
+                            if value:
+                                f_out.write(str(value) + "\n")
+                    elif isinstance(slots, list):
+                        for value in slots:
+                            if value:
+                                f_out.write(str(value) + "\n")
 
     logger.info(f"Text extracted to {output_path}")
     return output_path
@@ -331,16 +343,27 @@ def main():
         help="Use hybrid Mamba+MoE+Attention blocks (requires mamba-ssm)",
     )
     parser.add_argument(
-        "--num-experts",
+        "--moe-shared-experts",
         type=int,
         default=None,
-        help="Number of experts in MoE layer (default: 4)",
+        help="Number of shared experts (always active, default: 1)",
     )
     parser.add_argument(
-        "--experts-per-token",
+        "--moe-routed-experts",
         type=int,
         default=None,
-        help="Number of experts per token for top-k routing (default: 2)",
+        help="Number of routed experts (top-k selection, default: 8)",
+    )
+    parser.add_argument(
+        "--moe-top-k",
+        type=int,
+        default=None,
+        help="Top-k experts per token (default: 2)",
+    )
+    parser.add_argument(
+        "--no-moe-sigmoid-gating",
+        action="store_true",
+        help="Use softmax instead of sigmoid gating",
     )
     parser.add_argument(
         "--mamba-version",
@@ -361,6 +384,12 @@ def main():
         type=str,
         default=None,
         help="Path to checkpoint to resume from",
+    )
+    parser.add_argument(
+        "--intent-map",
+        type=str,
+        default=None,
+        help="Path to intent mapping JSON file (enables intent prediction training)",
     )
     parser.add_argument(
         "--seed",
@@ -404,10 +433,14 @@ def main():
     # Hybrid architecture overrides
     if args.use_hybrid:
         model_config_dict["use_hybrid_block"] = True
-    if args.num_experts is not None:
-        model_config_dict["num_experts"] = args.num_experts
-    if args.experts_per_token is not None:
-        model_config_dict["num_experts_per_tok"] = args.experts_per_token
+    if args.moe_shared_experts is not None:
+        model_config_dict["moe_num_shared_experts"] = args.moe_shared_experts
+    if args.moe_routed_experts is not None:
+        model_config_dict["moe_num_routed_experts"] = args.moe_routed_experts
+    if args.moe_top_k is not None:
+        model_config_dict["moe_top_k"] = args.moe_top_k
+    if args.no_moe_sigmoid_gating:
+        model_config_dict["moe_use_sigmoid_gating"] = False
     if args.mamba_version is not None:
         model_config_dict["mamba_version"] = args.mamba_version
     if args.no_mamba_cuda_kernels:
@@ -459,14 +492,29 @@ def main():
         else:
             logger.info(f"    Mamba1: d_state={model_config.mamba_d_state}, "
                         f"d_conv={model_config.mamba_d_conv}, expand={model_config.mamba_expand}")
-        logger.info(f"    MoE: num_experts={model_config.num_experts}, "
-                    f"experts_per_tok={model_config.num_experts_per_tok}, "
-                    f"intermediate={model_config.moe_intermediate_size}")
+        logger.info(f"    MoE (DeepSeek-V3): shared={model_config.moe_num_shared_experts}, "
+                    f"routed={model_config.moe_num_routed_experts}, top_k={model_config.moe_top_k}, "
+                    f"sigmoid={model_config.moe_use_sigmoid_gating}")
     else:
         logger.info(f"  Hybrid block: disabled (standard Transformer)")
     logger.info(f"  Loss weights: decision={model_config.decision_loss_weight}, "
                 f"tool={model_config.tool_loss_weight}, q={model_config.q_loss_weight}")
     logger.info(f"  Focal loss: alpha={model_config.focal_alpha}, gamma={model_config.focal_gamma}")
+
+    # Load intent mapping if provided (used for descriptions, not for limiting intents)
+    # The actual intent_to_id will be built from dataset to include ALL intents
+    original_intent_descriptions = {}
+    if args.intent_map:
+        with open(args.intent_map, "r", encoding="utf-8") as f:
+            original_intent_descriptions = json.load(f)
+        logger.info(f"  Intent prediction: ENABLED (loading descriptions from {args.intent_map})")
+        logger.info(f"    Original mapping has {len(original_intent_descriptions)} intents")
+        logger.info(f"    Note: All intents from dataset will be used for training")
+    else:
+        logger.info(f"  Intent prediction: disabled (no --intent-map provided)")
+
+    # intent_to_id will be set after loading dataset (to include ALL intents from data)
+    intent_to_id = None
 
     # Log training configuration
     world_size = get_world_size()
@@ -552,6 +600,7 @@ def main():
     # Load datasets from multiple files
     all_datasets = []
     tool_name_to_id = None  # Will be set from first dataset
+    # intent_to_id is None - let dataset build from data to include ALL intents
 
     for i, data_path in enumerate(args.train_data):
         dataset = TRMToolCallingDataset(
@@ -559,13 +608,22 @@ def main():
             tokenizer=tokenizer,
             max_seq_len=model_config.max_seq_len,
             tool_name_to_id=tool_name_to_id,  # Share tool mapping across files
+            intent_to_id=intent_to_id,  # Share intent mapping across files (None for first)
         )
-        # Get tool mapping from first dataset
+        # Get tool and intent mapping from first dataset
         if tool_name_to_id is None:
             tool_name_to_id = dataset.tool_name_to_id
+        if intent_to_id is None and args.intent_map:
+            # Get intent mapping built from data (includes ALL intents)
+            intent_to_id = dataset.intent_to_id
 
         all_datasets.append(dataset)
         logger.info(f"Loaded {data_path}: {len(dataset)} samples")
+
+    # Update model config with actual number of intents from data
+    if intent_to_id and args.intent_map:
+        model_config.num_intents = len(intent_to_id)
+        logger.info(f"Intent mapping built from data: {model_config.num_intents} unique intents")
 
     # Combine all datasets
     if len(all_datasets) == 1:
@@ -589,6 +647,7 @@ def main():
             tokenizer=tokenizer,
             max_seq_len=model_config.max_seq_len,
             tool_name_to_id=tool_name_to_id,
+            intent_to_id=intent_to_id,
         )
         logger.info(f"Loaded validation dataset: {len(val_dataset)} samples")
     elif args.val_split is not None and args.val_split > 0:
@@ -640,6 +699,40 @@ def main():
         logger.info(f"  Tool calls: {stats['tool_call']} ({stats['tool_call_ratio']:.1%})")
         logger.info(f"  Direct answers: {stats['direct_answer']}")
 
+        # Log intent statistics if available
+        if stats.get("num_intents", 0) > 0 or stats.get("intent_distribution"):
+            logger.info(f"  Intent statistics:")
+            logger.info(f"    Num intents in mapping: {stats.get('num_intents', 0)}")
+            logger.info(f"    Samples with intent: {stats['samples_with_intent']} ({stats['intent_coverage']:.1%})")
+            logger.info(f"    Intent distribution:")
+            for intent_name, count in stats.get("intent_distribution", []):
+                pct = count / stats['total_samples'] * 100
+                logger.info(f"      {intent_name}: {count} ({pct:.1f}%)")
+
+            # Save complete intent mapping (includes all intents from dataset)
+            # Build complete intent mapping with all intents from dataset
+            all_intents_from_data = [name for name, _ in stats.get("intent_distribution", [])]
+            complete_intent_mapping = {}
+            for intent_name in sorted(all_intents_from_data):
+                # Use original description if exists, otherwise empty string
+                complete_intent_mapping[intent_name] = original_intent_descriptions.get(intent_name, "")
+
+            # Save to output directory
+            intent_output_path = output_dir / "intent_mapping.json"
+            with open(intent_output_path, "w", encoding="utf-8") as f:
+                json.dump(complete_intent_mapping, f, indent=2, ensure_ascii=False)
+            logger.info(f"  Saved complete intent mapping to {intent_output_path}")
+            logger.info(f"    Total intents: {len(complete_intent_mapping)}")
+
+            # Warn about intents not in original mapping
+            missing_intents = [k for k, v in complete_intent_mapping.items() if v == ""]
+            if missing_intents:
+                logger.warning(f"    {len(missing_intents)} intents have no description (not in original mapping):")
+                for intent in missing_intents[:10]:  # Show first 10
+                    logger.warning(f"      - {intent}")
+                if len(missing_intents) > 10:
+                    logger.warning(f"      ... and {len(missing_intents) - 10} more")
+
     # Create data loaders
     pad_token_id = tokenizer.pad_token_id if tokenizer else 0
     train_dataloader = create_dataloader(
@@ -669,24 +762,17 @@ def main():
     # Wrap with DDP if distributed
     if is_distributed():
         local_rank = device.index  # Get GPU index from device
-        # Note: static_graph=True causes hangs with Mamba2's custom CUDA kernels
-        # Use find_unused_parameters for hybrid mode, static_graph for standard mode
-        if model_config.use_hybrid_block:
-            model = DDP(
-                model,
-                device_ids=[local_rank],
-                output_device=local_rank,
-                find_unused_parameters=True,  # Required for Mamba2 compatibility
-            )
-            logger.info("Wrapped model with DDP (find_unused_parameters=True for hybrid mode)")
-        else:
-            model = DDP(
-                model,
-                device_ids=[local_rank],
-                output_device=local_rank,
-                static_graph=True,  # Graph structure is fixed, enables optimizations
-            )
-            logger.info("Wrapped model with DDP (static_graph=True)")
+        # Always use find_unused_parameters=True to handle:
+        # - Optional IntentHead (when num_intents=0)
+        # - Hybrid mode with Mamba2 CUDA kernels
+        # - Future optional heads
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
+        logger.info("Wrapped model with DDP (find_unused_parameters=True)")
 
     # Warmup for Mamba2 Triton kernels (compile JIT kernels before training)
     if model_config.use_hybrid_block and model_config.mamba_version == 2:
@@ -719,6 +805,7 @@ def main():
             raise
 
     # Create trainer
+    intent_names = list(intent_to_id.keys()) if intent_to_id else []
     trainer = TRMTrainer(
         model=model,
         config=model_config,
@@ -727,6 +814,7 @@ def main():
         eval_dataloader=val_dataloader,
         device=device,
         tool_names=list(tool_name_to_id.keys()),
+        intent_names=intent_names,
     )
 
     # Resume from checkpoint if specified

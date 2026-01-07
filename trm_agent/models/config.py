@@ -53,13 +53,18 @@ class TRMConfig:
     mamba_chunk_size: int = 256  # Chunk size for Mamba2 (must be power of 2: 64, 128, 256)
     mamba_use_mem_eff_path: bool = True  # Use optimized CUDA kernels (set False if hanging)
 
-    # MoE (Mixture of Experts) configuration
-    num_experts: int = 4  # Number of expert MLPs
-    num_experts_per_tok: int = 2  # Top-k experts per token
+    # MoE (Mixture of Experts) configuration - DeepSeek-V3 style
+    moe_num_shared_experts: int = 1  # Shared experts (always active)
+    moe_num_routed_experts: int = 8  # Routed experts (top-k selection)
+    moe_top_k: int = 2  # Top-k experts per token
     moe_intermediate_size: int = 1024  # Expert MLP hidden size
+    moe_use_sigmoid_gating: bool = True  # Sigmoid vs softmax gating
+    moe_bias_update_speed: float = 0.001  # Bias update rate for load balancing
+    moe_seq_aux_loss_weight: float = 0.0  # Sequence-wise aux loss (0 = disabled)
 
     # Output dimensions
     num_tools: int = 10  # Number of available tools
+    num_intents: int = 0  # Number of intents (0 = disabled, load from intent_map)
 
     # Role tokens
     num_roles: int = 4  # user, assistant, tool_call, tool_response
@@ -70,9 +75,10 @@ class TRMConfig:
     # Loss weights
     decision_loss_weight: float = 1.0
     tool_loss_weight: float = 1.0
+    intent_loss_weight: float = 1.0  # Intent prediction loss weight
     q_loss_weight: float = 0.5
 
-    # Focal Loss parameters (for imbalanced decision classification)
+    # Focal Loss parameters (for imbalanced classification)
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
 
@@ -166,16 +172,22 @@ class TRMConfig:
             "mamba_headdim": self.mamba_headdim,
             "mamba_chunk_size": self.mamba_chunk_size,
             "mamba_use_mem_eff_path": self.mamba_use_mem_eff_path,
-            # MoE
-            "num_experts": self.num_experts,
-            "num_experts_per_tok": self.num_experts_per_tok,
+            # MoE (DeepSeek-V3 style)
+            "moe_num_shared_experts": self.moe_num_shared_experts,
+            "moe_num_routed_experts": self.moe_num_routed_experts,
+            "moe_top_k": self.moe_top_k,
             "moe_intermediate_size": self.moe_intermediate_size,
+            "moe_use_sigmoid_gating": self.moe_use_sigmoid_gating,
+            "moe_bias_update_speed": self.moe_bias_update_speed,
+            "moe_seq_aux_loss_weight": self.moe_seq_aux_loss_weight,
             "num_tools": self.num_tools,
+            "num_intents": self.num_intents,
             "num_roles": self.num_roles,
             "ema_decay": self.ema_decay,
             # Loss weights
             "decision_loss_weight": self.decision_loss_weight,
             "tool_loss_weight": self.tool_loss_weight,
+            "intent_loss_weight": self.intent_loss_weight,
             "q_loss_weight": self.q_loss_weight,
             "focal_alpha": self.focal_alpha,
             "focal_gamma": self.focal_gamma,

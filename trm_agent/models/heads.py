@@ -143,14 +143,56 @@ class ContentHead(nn.Module):
         return self.lm_head(y)
 
 
+class IntentHead(nn.Module):
+    """Intent prediction head.
+
+    Predicts the next intent/action of the assistant.
+    Uses classification over available intents loaded from intent mapping.
+    """
+
+    def __init__(self, config: TRMConfig):
+        super().__init__()
+        self.config = config
+        self.num_intents = getattr(config, "num_intents", 0)
+
+        if self.num_intents > 0:
+            self.norm = RMSNorm(config.hidden_size)
+            self.classifier = nn.Sequential(
+                nn.Linear(config.hidden_size, config.hidden_size // 2, bias=False),
+                nn.GELU(),
+                nn.Linear(config.hidden_size // 2, self.num_intents, bias=False),
+            )
+        else:
+            self.norm = None
+            self.classifier = None
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor | None:
+        """Predict intent.
+
+        Args:
+            y: Answer embedding [batch, seq_len, hidden_size]
+
+        Returns:
+            Intent logits [batch, num_intents] or None if num_intents=0
+        """
+        if self.num_intents == 0 or self.classifier is None:
+            return None
+
+        y = self.norm(y)
+        y_pooled = y.mean(dim=1)  # [batch, hidden_size]
+        return self.classifier(y_pooled)
+
+
 class OutputHead(nn.Module):
     """Combined output head for TRM.
 
     Combines all prediction heads into a single module:
     - DecisionHead: tool_call vs direct_answer
     - ToolHead: which tool to call
+    - IntentHead: next intent prediction (optional)
 
     Note: Span extraction (slots/params) is handled by GLiNER2.
+    Note: ContentHead is not included here (Phase 2 feature).
     """
 
     def __init__(self, config: TRMConfig):
@@ -159,7 +201,13 @@ class OutputHead(nn.Module):
 
         self.decision_head = DecisionHead(config)
         self.tool_head = ToolHead(config)
-        self.content_head = ContentHead(config)  # Not trained in Phase 1
+
+        # Only create IntentHead if num_intents > 0
+        self.num_intents = getattr(config, "num_intents", 0)
+        if self.num_intents > 0:
+            self.intent_head = IntentHead(config)
+        else:
+            self.intent_head = None
 
     def forward(
         self, y: torch.Tensor
@@ -170,12 +218,19 @@ class OutputHead(nn.Module):
             y: Answer embedding [batch, seq_len, hidden_size]
 
         Returns:
-            Dictionary with decision_logits and tool_logits
+            Dictionary with decision_logits, tool_logits, and intent_logits
         """
         decision_logits = self.decision_head(y)
         tool_logits = self.tool_head(y)
 
-        return {
+        result = {
             "decision_logits": decision_logits,
             "tool_logits": tool_logits,
         }
+
+        if self.intent_head is not None:
+            intent_logits = self.intent_head(y)
+            if intent_logits is not None:
+                result["intent_logits"] = intent_logits
+
+        return result

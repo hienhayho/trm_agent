@@ -1,26 +1,69 @@
 """GLiNER2-based entity extraction for tool arguments and slots.
 
-GLiNER2 provides improved entity extraction with support for LoRA adapters,
-enabling domain-specific fine-tuning while keeping the base model frozen.
+GLiNER2 provides improved entity extraction with support for:
+- LoRA adapters: domain-specific fine-tuning while keeping the base model frozen
+- Full finetuning: complete model weights saved to disk
 """
 
+import warnings
 from pathlib import Path
 from typing import Optional, Union
 
 import torch
 from gliner2 import GLiNER2
+from transformers import AutoTokenizer
+
+
+def _load_gliner2_with_fixed_tokenizer(model_path: str) -> GLiNER2:
+    """Load GLiNER2 model with fixed Mistral tokenizer regex.
+
+    Suppresses tokenizer warnings during loading and then replaces
+    the tokenizer with a properly configured one.
+    """
+    # Suppress tokenizer warnings during initial load
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*incorrect regex pattern.*")
+        warnings.filterwarnings("ignore", message=".*fix_mistral_regex.*")
+        model = GLiNER2.from_pretrained(model_path)
+
+    # Replace tokenizer with fixed version
+    try:
+        fixed_tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            fix_mistral_regex=True,
+        )
+        model.processor.tokenizer = fixed_tokenizer
+    except TypeError:
+        # fix_mistral_regex not supported in older transformers versions
+        pass
+
+    return model
+
+
+def _is_lora_adapter(path: Path) -> bool:
+    """Check if path contains a LoRA adapter (has adapter_config.json)."""
+    return (path / "adapter_config.json").exists()
+
+
+def _is_full_model(path: Path) -> bool:
+    """Check if path contains a full model (has model weights but no adapter_config)."""
+    has_safetensors = (path / "model.safetensors").exists()
+    has_pytorch = (path / "pytorch_model.bin").exists()
+    has_config = (path / "config.json").exists()
+    return (has_safetensors or has_pytorch) and has_config and not _is_lora_adapter(path)
 
 
 class GLiNER2Extractor:
     """Extract slots and tool arguments using GLiNER2 NER model.
 
     This class provides entity extraction capabilities using a pre-trained
-    or fine-tuned GLiNER2 model. It supports LoRA adapters for domain-specific
-    extraction without modifying the base model.
+    or fine-tuned GLiNER2 model. It supports:
+    - LoRA adapters for efficient domain-specific extraction
+    - Full finetuned models for maximum performance
 
     Supports loading models from:
     - HuggingFace Hub (e.g., "fastino/gliner2-base-v1")
-    - Local path
+    - Local path (full finetuned model)
 
     Supports loading LoRA adapters from:
     - Local path (e.g., "outputs/gliner2/adapter/final")
@@ -38,6 +81,11 @@ class GLiNER2Extractor:
         >>> extractor = GLiNER2Extractor(
         ...     adapter_path="outputs/gliner2/adapter/final"
         ... )
+
+        >>> # Using full finetuned model
+        >>> extractor = GLiNER2Extractor(
+        ...     adapter_path="outputs/gliner2_full/best"  # Auto-detects full model
+        ... )
     """
 
     def __init__(
@@ -53,8 +101,10 @@ class GLiNER2Extractor:
         Args:
             model_name: HuggingFace model name or local path to base model.
                 Default is GLiNER2 base model.
-            adapter_path: Path to LoRA adapter directory (optional).
-                If provided, loads the adapter on top of base model.
+            adapter_path: Path to LoRA adapter directory OR full finetuned model.
+                Auto-detects whether it's an adapter or full model.
+                If adapter: loads on top of base model.
+                If full model: loads directly (ignores model_name).
             device: Device to run model on ("cuda" or "cpu").
                 Auto-detected if None.
             threshold: Confidence threshold for entity extraction.
@@ -72,15 +122,35 @@ class GLiNER2Extractor:
             "name",
             "contract_id",
         ]
+        self._is_full_model = False
 
-        # Load base model
-        print(f"Loading GLiNER2 base model: {self.model_name}")
-        self.model = GLiNER2.from_pretrained(self.model_name)
-        self.model = self.model.to(self.device)
-
-        # Load adapter if provided
+        # Check if adapter_path is actually a full finetuned model
         if self.adapter_path:
-            self.load_adapter(self.adapter_path)
+            adapter_path_obj = Path(self.adapter_path)
+            if _is_full_model(adapter_path_obj):
+                # Load full finetuned model directly
+                print(f"Loading GLiNER2 full finetuned model: {self.adapter_path}")
+                self.model = _load_gliner2_with_fixed_tokenizer(self.adapter_path)
+                self.model = self.model.to(self.device)
+                self._is_full_model = True
+            elif _is_lora_adapter(adapter_path_obj):
+                # Load base model + LoRA adapter
+                print(f"Loading GLiNER2 base model: {self.model_name}")
+                self.model = _load_gliner2_with_fixed_tokenizer(self.model_name)
+                self.model = self.model.to(self.device)
+                self.load_adapter(self.adapter_path)
+            else:
+                raise FileNotFoundError(
+                    f"Path '{self.adapter_path}' is neither a LoRA adapter "
+                    f"(missing adapter_config.json) nor a full model "
+                    f"(missing config.json + model weights). "
+                    f"Please check the path."
+                )
+        else:
+            # Load base model only
+            print(f"Loading GLiNER2 base model: {self.model_name}")
+            self.model = _load_gliner2_with_fixed_tokenizer(self.model_name)
+            self.model = self.model.to(self.device)
 
     def load_adapter(self, adapter_path: Union[str, Path]) -> None:
         """Load a LoRA adapter.
@@ -94,7 +164,14 @@ class GLiNER2Extractor:
         self.adapter_path = adapter_path
 
     def unload_adapter(self) -> None:
-        """Unload the current LoRA adapter."""
+        """Unload the current LoRA adapter.
+
+        Note: This only works for LoRA adapters, not full finetuned models.
+        """
+        if self._is_full_model:
+            print("Cannot unload adapter: model is a full finetuned model, not an adapter")
+            return
+
         if self.has_adapter:
             print("Unloading GLiNER2 adapter")
             self.model.unload_adapter()
@@ -102,8 +179,15 @@ class GLiNER2Extractor:
 
     @property
     def has_adapter(self) -> bool:
-        """Check if an adapter is currently loaded."""
+        """Check if an adapter is currently loaded (LoRA only, not full finetune)."""
+        if self._is_full_model:
+            return False
         return self.model.has_adapter
+
+    @property
+    def is_finetuned(self) -> bool:
+        """Check if model has been finetuned (either LoRA or full)."""
+        return self._is_full_model or self.has_adapter
 
     def extract(
         self,

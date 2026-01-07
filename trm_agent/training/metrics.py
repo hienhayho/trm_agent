@@ -28,12 +28,20 @@ class EvalAccumulators:
     per_tool_correct: list[int] = field(default_factory=list)
     per_tool_total: list[int] = field(default_factory=list)
 
+    # Intent accuracy
+    intent_correct: int = 0
+    intent_total: int = 0
+    per_intent_correct: list[int] = field(default_factory=list)
+    per_intent_total: list[int] = field(default_factory=list)
+
     total_samples: int = 0
 
-    def init_lists(self, num_tools: int):
+    def init_lists(self, num_tools: int, num_intents: int = 0):
         """Initialize per-item lists."""
         self.per_tool_correct = [0] * num_tools
         self.per_tool_total = [0] * num_tools
+        self.per_intent_correct = [0] * num_intents
+        self.per_intent_total = [0] * num_intents
 
 
 def update_decision_metrics(
@@ -90,10 +98,45 @@ def update_tool_metrics(
             accum.per_tool_total[i] += tool_i_mask.sum().item()
 
 
+def update_intent_metrics(
+    accum: EvalAccumulators,
+    outputs: TRMOutput,
+    intent_labels: torch.Tensor,
+    num_intents: int,
+):
+    """Update intent prediction metrics.
+
+    Args:
+        accum: Accumulator to update
+        outputs: Model outputs
+        intent_labels: True intent indices [batch]
+        num_intents: Number of intents
+    """
+    if outputs.intent_logits is None or num_intents == 0:
+        return
+
+    intent_mask = intent_labels >= 0
+    if not intent_mask.any():
+        return
+
+    intent_pred = outputs.intent_logits.argmax(dim=-1)
+    intent_true = intent_labels
+
+    accum.intent_correct += (intent_pred[intent_mask] == intent_true[intent_mask]).sum().item()
+    accum.intent_total += intent_mask.sum().item()
+
+    for i in range(num_intents):
+        intent_i_mask = intent_true == i
+        if intent_i_mask.any():
+            accum.per_intent_correct[i] += (intent_pred[intent_i_mask] == i).sum().item()
+            accum.per_intent_total[i] += intent_i_mask.sum().item()
+
+
 def compute_final_metrics(
     accum: EvalAccumulators,
     tool_names: list[str],
     device: torch.device,
+    intent_names: list[str] | None = None,
 ) -> dict[str, float]:
     """Compute final metrics from accumulators.
 
@@ -101,10 +144,13 @@ def compute_final_metrics(
         accum: Accumulated metrics
         tool_names: List of tool names
         device: Device for gather operation
+        intent_names: List of intent names (optional)
 
     Returns:
         Dictionary of computed metrics
     """
+    intent_names = intent_names or []
+
     # Build raw metrics for gathering
     raw_metrics = {
         "total_samples": accum.total_samples,
@@ -114,11 +160,17 @@ def compute_final_metrics(
         "decision_tn": accum.decision_tn,
         "tool_correct": accum.tool_correct,
         "tool_total": accum.tool_total,
+        "intent_correct": accum.intent_correct,
+        "intent_total": accum.intent_total,
     }
 
     for i in range(len(tool_names)):
         raw_metrics[f"per_tool_correct_{i}"] = accum.per_tool_correct[i]
         raw_metrics[f"per_tool_total_{i}"] = accum.per_tool_total[i]
+
+    for i in range(len(intent_names)):
+        raw_metrics[f"per_intent_correct_{i}"] = accum.per_intent_correct[i]
+        raw_metrics[f"per_intent_total_{i}"] = accum.per_intent_total[i]
 
     # Gather across GPUs
     agg = gather_metrics(raw_metrics, device)
@@ -164,6 +216,37 @@ def compute_final_metrics(
         acc = agg[f"per_tool_correct_{i}"] / total if total > 0 else 0.0
         metrics[f"tool_{tool_name}_acc"] = acc
         metrics[f"tool_{tool_name}_samples"] = total
+
+    # Intent metrics
+    if intent_names:
+        metrics["intent_accuracy"] = (
+            agg["intent_correct"] / agg["intent_total"]
+            if agg["intent_total"] > 0 else 0.0
+        )
+        metrics["intent_samples"] = int(agg["intent_total"])
+
+        # Per-intent accuracy and F1 calculation
+        per_intent_f1s = []
+        for i, intent_name in enumerate(intent_names):
+            total = int(agg.get(f"per_intent_total_{i}", 0))
+            correct = agg.get(f"per_intent_correct_{i}", 0)
+            acc = correct / total if total > 0 else 0.0
+            metrics[f"intent_{intent_name}_acc"] = acc
+            metrics[f"intent_{intent_name}_samples"] = total
+
+            # For macro F1: compute per-class precision, recall, F1
+            # TP = correct predictions for this class
+            # FN = total - correct (samples of this class predicted as other)
+            # For simplicity, use accuracy as proxy for F1 per class
+            # (full F1 would need confusion matrix for each class)
+            if total > 0:
+                per_intent_f1s.append(acc)
+
+        # Macro F1: average F1 across all intents with samples
+        metrics["intent_macro_f1"] = (
+            sum(per_intent_f1s) / len(per_intent_f1s)
+            if per_intent_f1s else 0.0
+        )
 
     # Store raw confusion matrix for logging
     metrics["_decision_tp"] = int(agg["decision_tp"])

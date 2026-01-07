@@ -59,6 +59,7 @@ class TRMCollator:
 
         decision_labels = torch.zeros(batch_size, dtype=torch.float)
         tool_name_labels = torch.full((batch_size,), -1, dtype=torch.long)
+        intent_labels = torch.full((batch_size,), -1, dtype=torch.long)
 
         # Fill in batch tensors
         for i, sample in enumerate(batch):
@@ -71,12 +72,17 @@ class TRMCollator:
             decision_labels[i] = sample["decision_label"]
             tool_name_labels[i] = sample["tool_name_label"]
 
+            # Handle intent_label (may not exist in older datasets)
+            if "intent_label" in sample:
+                intent_labels[i] = sample["intent_label"]
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "role_ids": role_ids,
             "decision_labels": decision_labels,
             "tool_name_labels": tool_name_labels,
+            "intent_labels": intent_labels,
         }
 
 

@@ -55,6 +55,7 @@ def log_eval_metrics(
     epoch: int,
     metrics: dict[str, float],
     tool_names: list[str],
+    intent_names: list[str] | None = None,
 ):
     """Log evaluation metrics using rich tables.
 
@@ -62,9 +63,12 @@ def log_eval_metrics(
         epoch: Current epoch number
         metrics: Dictionary of evaluation metrics
         tool_names: List of tool names
+        intent_names: List of intent names (optional)
     """
     if not is_main_process():
         return
+
+    intent_names = intent_names or []
 
     # Main metrics table
     main_table = Table(
@@ -98,6 +102,19 @@ def log_eval_metrics(
         f"{metrics.get('tool_accuracy', 0):.4f} ({metrics.get('tool_samples', 0)} samples)"
     )
 
+    # Intent metrics if available
+    if intent_names and "intent_accuracy" in metrics:
+        main_table.add_row("", "")
+        main_table.add_row(
+            "Intent Accuracy",
+            f"{metrics.get('intent_accuracy', 0):.4f} ({metrics.get('intent_samples', 0)} samples)"
+        )
+        if "intent_macro_f1" in metrics:
+            main_table.add_row(
+                "Intent Macro F1",
+                f"[bold cyan]{metrics.get('intent_macro_f1', 0):.4f}[/bold cyan]"
+            )
+
     console.print(main_table)
 
     # Per-tool accuracy table
@@ -121,6 +138,29 @@ def log_eval_metrics(
             )
 
         console.print(tool_table)
+
+    # Per-intent accuracy table
+    if intent_names and "intent_accuracy" in metrics:
+        intent_table = Table(
+            title="Per-Intent Accuracy",
+            show_header=True,
+            header_style="bold green"
+        )
+        intent_table.add_column("Intent Name", style="bold")
+        intent_table.add_column("Accuracy", justify="right")
+        intent_table.add_column("Samples", justify="right")
+
+        for intent_name in intent_names:
+            acc = metrics.get(f"intent_{intent_name}_acc", 0)
+            samples = int(metrics.get(f"intent_{intent_name}_samples", 0))
+            if samples > 0:  # Only show intents with samples
+                intent_table.add_row(
+                    intent_name,
+                    _color_accuracy(acc),
+                    str(samples)
+                )
+
+        console.print(intent_table)
 
     # Log confusion matrix if available
     if "_decision_tp" in metrics:
