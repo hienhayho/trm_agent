@@ -9,16 +9,18 @@ This document describes the loss functions used for training the TRM model.
 TRM training uses loss functions combined into a weighted sum:
 
 ```
-Total Loss = w_d * L_decision + w_t * L_tool + w_q * L_q
+Total Loss = w_d * L_decision + w_t * L_tool + w_i * L_intent + w_q * L_q
 ```
 
 | Loss | Weight | Description |
 |------|--------|-------------|
 | `L_decision` | 1.0 | Decision classification (Focal Loss) |
 | `L_tool` | 1.0 | Tool name prediction (Cross Entropy) |
+| `L_intent` | 1.0 | Intent prediction (Focal Cross-Entropy, optional) |
 | `L_q` | 0.5 | Halting probability (BCE) |
 
 > **Note:** Slot/arg span extraction losses are no longer used in TRM. See GLiNER2 documentation for entity extraction.
+> **Note:** Intent loss is only computed when `--intent-map` is provided during training.
 
 ## Loss Components
 
@@ -148,13 +150,90 @@ tool_name_labels = [
 ]
 ```
 
-### 3. Slot Loss (Deprecated)
+### 3. Intent Loss (Focal Cross-Entropy)
+
+Multi-class classification for predicting the next assistant intent.
+
+#### Why Focal Cross-Entropy?
+
+Intent distribution is often highly imbalanced:
+- Some intents (e.g., "greeting") are very common
+- Others (e.g., "escalate_to_human") are rare
+
+Standard Cross-Entropy biases toward majority classes. **Focal Cross-Entropy** addresses this by focusing on hard-to-classify examples.
+
+#### Formula
+
+```
+FL(p_t) = -(1 - p_t)^γ * log(p_t)
+```
+
+Where:
+- `p_t` = probability of the correct class
+- `γ` = focusing parameter (default: 2.0)
+
+#### Implementation
+
+```python
+class FocalCrossEntropyLoss(nn.Module):
+    def __init__(self, gamma=2.0, ignore_index=-1):
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+
+    def forward(self, logits, targets):
+        # Filter out ignored indices
+        mask = targets != self.ignore_index
+        if not mask.any():
+            return torch.tensor(0.0)
+        logits = logits[mask]
+        targets = targets[mask]
+
+        # Softmax probabilities
+        probs = F.softmax(logits, dim=-1)
+
+        # Get probability of target class
+        batch_size = targets.shape[0]
+        pt = probs[torch.arange(batch_size), targets]
+
+        # Focal weight: (1 - pt)^gamma
+        focal_weight = (1 - pt) ** self.gamma
+
+        # Cross-entropy loss
+        ce_loss = F.cross_entropy(logits, targets, reduction="none")
+
+        # Apply focal weight
+        return (focal_weight * ce_loss).mean()
+```
+
+#### Label Format
+
+```python
+intent_labels = [
+    2,   # Sample 0: intent ID = 2 (e.g., "greeting")
+    -1,  # Sample 1: unknown intent (ignored)
+    0,   # Sample 2: intent ID = 0 (e.g., "check_balance")
+    3,   # Sample 3: intent ID = 3 (e.g., "make_payment")
+]
+```
+
+#### Enabling Intent Training
+
+Intent training is enabled by providing `--intent-map` flag:
+
+```bash
+uv run python tools/train.py \
+    --train-data data/train.jsonl \
+    --intent-map data/intend.json \
+    --output-dir outputs/
+```
+
+### 4. Slot Loss (Deprecated)
 
 > **Deprecated:** Slot extraction is now handled by **GLiNER2**, not TRM. This section is kept for historical reference.
 
 Binary classification for each slot's presence (no longer used in TRM training).
 
-### 4. Q Loss (BCE)
+### 5. Q Loss (BCE)
 
 Trains the halting head for Adaptive Computational Time (ACT).
 
@@ -200,9 +279,12 @@ class TRMLoss(nn.Module):
         self.decision_loss = FocalLoss(alpha=config.focal_alpha,
                                         gamma=config.focal_gamma)
         self.tool_loss = nn.CrossEntropyLoss(ignore_index=-1)
+        self.intent_loss = FocalCrossEntropyLoss(gamma=config.focal_gamma,
+                                                  ignore_index=-1)
         self.q_loss = nn.BCEWithLogitsLoss()
+        self.num_intents = config.num_intents
 
-    def forward(self, outputs, decision_labels, tool_name_labels):
+    def forward(self, outputs, decision_labels, tool_name_labels, intent_labels=None):
         losses = {}
 
         # 1. Decision loss
@@ -217,14 +299,28 @@ class TRMLoss(nn.Module):
         else:
             losses["tool_loss"] = 0.0
 
-        # 3. Q loss
+        # 3. Intent loss (if enabled)
+        if self.num_intents > 0 and intent_labels is not None:
+            intent_mask = intent_labels >= 0
+            if intent_mask.any():
+                losses["intent_loss"] = self.intent_loss(
+                    outputs.intent_logits[intent_mask],
+                    intent_labels[intent_mask]
+                )
+            else:
+                losses["intent_loss"] = 0.0
+        else:
+            losses["intent_loss"] = 0.0
+
+        # 4. Q loss
         is_correct = compute_correctness(outputs, decision_labels)
         losses["q_loss"] = self.q_loss(outputs.q_logits, is_correct)
 
-        # 4. Total
+        # 5. Total
         losses["total_loss"] = (
             w_d * losses["decision_loss"] +
             w_t * losses["tool_loss"] +
+            w_i * losses["intent_loss"] +
             w_q * losses["q_loss"]
         )
 
@@ -237,8 +333,9 @@ class TRMLoss(nn.Module):
 losses = {
     "decision_loss": 0.234,   # Focal loss value
     "tool_loss": 1.456,       # Cross entropy value
+    "intent_loss": 0.892,     # Focal cross-entropy value (if enabled)
     "q_loss": 0.567,          # BCE value
-    "total_loss": 1.892,      # Weighted sum
+    "total_loss": 2.784,      # Weighted sum
 }
 ```
 
@@ -300,6 +397,7 @@ Step 1    Step 2    Step 3    ...    Step N_sup
 # In config
 decision_loss_weight: 1.0
 tool_loss_weight: 1.0
+intent_loss_weight: 1.0  # Only used if num_intents > 0
 q_loss_weight: 0.5
 
 focal_alpha: 0.25
@@ -312,6 +410,10 @@ focal_gamma: 2.0
 config = TRMConfig(
     # Increase decision importance
     decision_loss_weight=2.0,
+
+    # Enable intent prediction (num_intents set automatically from --intent-map)
+    num_intents=10,
+    intent_loss_weight=1.0,
 
     # Adjust focal loss for different imbalance
     focal_alpha=0.5,   # Equal weight for both classes
@@ -389,6 +491,7 @@ content_loss = CrossEntropyLoss(content_logits, content_labels)
 |--------|-------------------|
 | `decision_loss` | Decreases steadily |
 | `tool_loss` | Decreases (may fluctuate if few tool_call samples) |
+| `intent_loss` | Decreases (if enabled, may fluctuate with imbalanced intents) |
 | `q_loss` | Starts high, decreases as model improves |
 | `total_loss` | Overall decreasing trend |
 
@@ -398,5 +501,6 @@ content_loss = CrossEntropyLoss(content_logits, content_labels)
 |-------|----------------|
 | `decision_loss` not decreasing | Learning rate too low, or severe imbalance |
 | `tool_loss` = 0 always | No tool_call samples in batch |
+| `intent_loss` = 0 always | No samples with intent labels in batch |
 | `q_loss` stuck at ~0.69 | Model predicting random (log(2) ≈ 0.69) |
 | Loss exploding | Learning rate too high, gradient issues |

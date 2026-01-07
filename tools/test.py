@@ -18,6 +18,13 @@ Usage:
         --tokenizer-path outputs/tokenizer/tokenizer.model \
         --gliner2-adapter outputs/gliner2/best
 
+    # With GLiNER2 full finetuned model (auto-detected):
+    uv run python tools/test.py \
+        --checkpoint outputs/checkpoint_epoch_1.pt \
+        --test-data data/test.json \
+        --tokenizer-path outputs/tokenizer/tokenizer.model \
+        --gliner2-adapter outputs/gliner2_full/best
+
     # Multi-GPU with torchrun:
     uv run torchrun --nproc_per_node=2 tools/test.py \
         --checkpoint outputs/checkpoint_epoch_1.pt \
@@ -365,6 +372,10 @@ def run_batched_inference(
 ) -> list[tuple[int, dict]]:
     """Run batched inference with TRM (decision + tool) and GLiNER2 (entity extraction).
 
+    GLiNER2 extraction is run in two scenarios:
+    1. When model predicts tool_call: uses predicted tool name for end-to-end evaluation
+    2. When ground truth is tool_call: uses GT tool name for GLiNER2-only evaluation
+
     Args:
         model: TRM model
         dataloader: Test data loader
@@ -403,6 +414,9 @@ def run_batched_inference(
         for i in range(batch_size):
             idx = indices[i]
             sample = samples[idx]
+            gt = sample["ground_truth"]
+            gt_is_tool_call = gt["decision"] == "tool_call"
+            gt_tool_name = gt.get("tool_name") if gt_is_tool_call else None
 
             decision_prob = torch.sigmoid(outputs.decision_logits[i]).item()
             decision = "tool_call" if decision_prob > 0.5 else "direct_answer"
@@ -413,6 +427,8 @@ def run_batched_inference(
                 "tool_name": None,
                 "tool_args": {},
                 "slots": {},
+                # GLiNER2-only evaluation (using GT tool name)
+                "gt_tool_args": {},
             }
 
             tool_name = None
@@ -426,14 +442,25 @@ def run_batched_inference(
                 # Build full text from conversation history
                 full_text = conversation_to_text(sample["history"])
 
-                # Extract slots and tool args
-                slots, tool_args = gliner2_extractor.extract_all(
-                    text=full_text,
-                    tool_name=tool_name if decision == "tool_call" else None,
-                    tool_params=tool_param_mapping,
-                )
-                result["slots"] = slots
-                result["tool_args"] = tool_args
+                # 1. End-to-end extraction: use predicted tool name (when model predicts tool_call)
+                if decision == "tool_call":
+                    slots, tool_args = gliner2_extractor.extract_all(
+                        text=full_text,
+                        tool_name=tool_name,
+                        tool_params=tool_param_mapping,
+                    )
+                    result["slots"] = slots
+                    result["tool_args"] = tool_args
+
+                # 2. GLiNER2-only extraction: use GT tool name (when GT is tool_call)
+                #    This allows evaluating GLiNER2 independently of TRM decision accuracy
+                if gt_is_tool_call and gt_tool_name:
+                    _, gt_tool_args = gliner2_extractor.extract_all(
+                        text=full_text,
+                        tool_name=gt_tool_name,
+                        tool_params=tool_param_mapping,
+                    )
+                    result["gt_tool_args"] = gt_tool_args
 
             local_predictions.append((idx, result))
 
@@ -539,13 +566,21 @@ def compute_metrics(
     per_tool_correct = {name: 0 for name in tool_names}
     per_tool_total = {name: 0 for name in tool_names}
 
-    # Argument extraction metrics
+    # End-to-end argument extraction metrics (uses predicted tool name)
     arg_exact_match = 0  # Exact string match
     arg_partial_match = 0  # GT value is substring of pred or vice versa
     arg_total = 0
 
-    # Per-argument metrics
+    # Per-argument metrics (end-to-end)
     per_arg_stats: dict[str, dict] = {}
+
+    # GLiNER2-only argument extraction metrics (uses GT tool name)
+    gliner2_arg_exact_match = 0
+    gliner2_arg_partial_match = 0
+    gliner2_arg_total = 0
+
+    # Per-argument metrics (GLiNER2-only)
+    gliner2_per_arg_stats: dict[str, dict] = {}
 
     for pred, gt, sample in zip(predictions, ground_truths, samples):
         pred_is_tool = pred["decision"] == "tool_call"
@@ -572,10 +607,11 @@ def compute_metrics(
                 if gt_tool in per_tool_correct:
                     per_tool_correct[gt_tool] += 1
 
-            # Compare tool arguments (GLiNER2 extraction)
+            # Get ground truth args
             gt_args = gt.get("tool_args", {})
-            pred_args = pred.get("tool_args", {})
 
+            # 1. End-to-end extraction metrics (uses predicted tool name)
+            pred_args = pred.get("tool_args", {})
             for arg_name, gt_value in gt_args.items():
                 if not gt_value:
                     continue
@@ -600,6 +636,32 @@ def compute_metrics(
                     # Only count partial match if prediction is non-empty
                     arg_partial_match += 1
                     per_arg_stats[arg_name]["partial"] += 1
+
+            # 2. GLiNER2-only extraction metrics (uses GT tool name)
+            gt_tool_args = pred.get("gt_tool_args", {})
+            for arg_name, gt_value in gt_args.items():
+                if not gt_value:
+                    continue
+
+                gliner2_arg_total += 1
+
+                # Initialize per-arg stats
+                if arg_name not in gliner2_per_arg_stats:
+                    gliner2_per_arg_stats[arg_name] = {"exact": 0, "partial": 0, "total": 0}
+                gliner2_per_arg_stats[arg_name]["total"] += 1
+
+                gt_value_str = str(gt_value) if not isinstance(gt_value, str) else gt_value
+                pred_value = gt_tool_args.get(arg_name, "")
+
+                gt_norm = normalize_value(gt_value_str)
+                pred_norm = normalize_value(pred_value)
+
+                if gt_norm == pred_norm:
+                    gliner2_arg_exact_match += 1
+                    gliner2_per_arg_stats[arg_name]["exact"] += 1
+                elif pred_norm and (gt_norm in pred_norm or pred_norm in gt_norm):
+                    gliner2_arg_partial_match += 1
+                    gliner2_per_arg_stats[arg_name]["partial"] += 1
 
     metrics = {}
 
@@ -647,7 +709,7 @@ def compute_metrics(
                 "total": per_tool_total[name],
             }
 
-    # Argument extraction metrics (GLiNER2)
+    # End-to-end argument extraction metrics (uses predicted tool name)
     metrics["arg_exact_match"] = (
         arg_exact_match / arg_total if arg_total > 0 else 0.0
     )
@@ -656,11 +718,33 @@ def compute_metrics(
     )
     metrics["arg_total"] = arg_total
 
-    # Per-argument breakdown
+    # Per-argument breakdown (end-to-end)
     metrics["per_arg"] = {}
     for arg_name, stats in per_arg_stats.items():
         if stats["total"] > 0:
             metrics["per_arg"][arg_name] = {
+                "exact_match": stats["exact"] / stats["total"],
+                "partial_match": (stats["exact"] + stats["partial"]) / stats["total"],
+                "exact": stats["exact"],
+                "partial": stats["partial"],
+                "total": stats["total"],
+            }
+
+    # GLiNER2-only argument extraction metrics (uses GT tool name)
+    metrics["gliner2_arg_exact_match"] = (
+        gliner2_arg_exact_match / gliner2_arg_total if gliner2_arg_total > 0 else 0.0
+    )
+    metrics["gliner2_arg_partial_match"] = (
+        (gliner2_arg_exact_match + gliner2_arg_partial_match) / gliner2_arg_total
+        if gliner2_arg_total > 0 else 0.0
+    )
+    metrics["gliner2_arg_total"] = gliner2_arg_total
+
+    # Per-argument breakdown (GLiNER2-only)
+    metrics["gliner2_per_arg"] = {}
+    for arg_name, stats in gliner2_per_arg_stats.items():
+        if stats["total"] > 0:
+            metrics["gliner2_per_arg"][arg_name] = {
                 "exact_match": stats["exact"] / stats["total"],
                 "partial_match": (stats["exact"] + stats["partial"]) / stats["total"],
                 "exact": stats["exact"],
@@ -697,8 +781,9 @@ def save_detailed_results(
     for idx, (sample, pred) in enumerate(zip(samples, predictions)):
         target_args = sample["ground_truth"].get("tool_args", {})
         pred_args = pred.get("tool_args", {})
+        gt_tool_args = pred.get("gt_tool_args", {})
 
-        # Compare arguments
+        # Compare arguments (end-to-end: uses predicted tool name)
         arg_comparison = {}
         for arg_name, gt_value in target_args.items():
             if not gt_value:
@@ -716,6 +801,24 @@ def save_detailed_results(
                 "partial_match": bool(pred_norm) and (gt_norm in pred_norm or pred_norm in gt_norm),
             }
 
+        # Compare arguments (GLiNER2-only: uses GT tool name)
+        gliner2_arg_comparison = {}
+        for arg_name, gt_value in target_args.items():
+            if not gt_value:
+                continue
+            gt_value_str = str(gt_value) if not isinstance(gt_value, str) else gt_value
+            gliner2_pred_value = gt_tool_args.get(arg_name, "")
+
+            gt_norm = normalize_value(gt_value_str)
+            gliner2_pred_norm = normalize_value(gliner2_pred_value)
+
+            gliner2_arg_comparison[arg_name] = {
+                "target": gt_value_str,
+                "prediction": gliner2_pred_value,
+                "exact_match": gt_norm == gliner2_pred_norm,
+                "partial_match": bool(gliner2_pred_norm) and (gt_norm in gliner2_pred_norm or gliner2_pred_norm in gt_norm),
+            }
+
         result = {
             "sample_id": idx,
             "conv_idx": sample.get("conv_idx", -1),
@@ -726,6 +829,7 @@ def save_detailed_results(
                 "decision_prob": pred["decision_prob"],
                 "tool_name": pred["tool_name"],
                 "tool_args": pred.get("tool_args", {}),
+                "gt_tool_args": gt_tool_args,  # GLiNER2-only extraction (uses GT tool name)
                 "slots": pred.get("slots", {}),
             },
             "target": {
@@ -737,7 +841,8 @@ def save_detailed_results(
                 "decision": pred["decision"] == sample["ground_truth"]["decision"],
                 "tool_name": pred["tool_name"] == sample["ground_truth"].get("tool_name"),
             },
-            "arg_comparison": arg_comparison,
+            "arg_comparison": arg_comparison,  # End-to-end
+            "gliner2_arg_comparison": gliner2_arg_comparison,  # GLiNER2-only
         }
         detailed_results.append(result)
 
@@ -776,14 +881,24 @@ def print_results(metrics: dict):
         f"{metrics['tool_accuracy']:.4f} ({metrics['tool_samples']} samples)",
     )
     main_table.add_row("", "")
-    main_table.add_row("[bold]GLiNER2 Extraction[/bold]", "")
+    main_table.add_row("[bold]End-to-End Extraction[/bold]", "(TRM decision + GLiNER2)")
     main_table.add_row(
         "Arg Exact Match",
-        f"[bold green]{metrics['arg_exact_match']:.4f}[/bold green] ({metrics['arg_total']} args)",
+        f"{metrics['arg_exact_match']:.4f} ({metrics['arg_total']} args)",
     )
     main_table.add_row(
         "Arg Partial Match",
         f"{metrics['arg_partial_match']:.4f}",
+    )
+    main_table.add_row("", "")
+    main_table.add_row("[bold]GLiNER2-Only Extraction[/bold]", "(GT tool name)")
+    main_table.add_row(
+        "Arg Exact Match",
+        f"[bold green]{metrics['gliner2_arg_exact_match']:.4f}[/bold green] ({metrics['gliner2_arg_total']} args)",
+    )
+    main_table.add_row(
+        "Arg Partial Match",
+        f"{metrics['gliner2_arg_partial_match']:.4f}",
     )
 
     console.print(main_table)
@@ -830,10 +945,10 @@ def print_results(metrics: dict):
 
         console.print(tool_table)
 
-    # Per-argument extraction accuracy
+    # Per-argument extraction accuracy (End-to-End)
     if metrics.get("per_arg"):
         arg_table = Table(
-            title="Per-Argument Extraction (GLiNER2)", show_header=True, header_style="bold green"
+            title="Per-Argument Extraction (End-to-End)", show_header=True, header_style="bold yellow"
         )
         arg_table.add_column("Argument", style="bold")
         arg_table.add_column("Exact Match", justify="right")
@@ -857,6 +972,36 @@ def print_results(metrics: dict):
             )
 
         console.print(arg_table)
+
+    # Per-argument extraction accuracy (GLiNER2-Only)
+    if metrics.get("gliner2_per_arg"):
+        gliner2_arg_table = Table(
+            title="Per-Argument Extraction (GLiNER2-Only, GT tool name)",
+            show_header=True,
+            header_style="bold green"
+        )
+        gliner2_arg_table.add_column("Argument", style="bold")
+        gliner2_arg_table.add_column("Exact Match", justify="right")
+        gliner2_arg_table.add_column("Partial Match", justify="right")
+        gliner2_arg_table.add_column("Samples", justify="right")
+
+        for arg_name, arg_metrics in sorted(metrics["gliner2_per_arg"].items()):
+            exact = arg_metrics["exact_match"]
+            if exact >= 0.8:
+                exact_str = f"[green]{exact:.4f}[/green]"
+            elif exact >= 0.5:
+                exact_str = f"[yellow]{exact:.4f}[/yellow]"
+            else:
+                exact_str = f"[red]{exact:.4f}[/red]"
+
+            gliner2_arg_table.add_row(
+                arg_name,
+                exact_str,
+                f"{arg_metrics['partial_match']:.4f}",
+                f"{arg_metrics['exact']}/{arg_metrics['total']}",
+            )
+
+        console.print(gliner2_arg_table)
 
 
 def main():
@@ -936,7 +1081,7 @@ def main():
         "--gliner2-adapter",
         type=str,
         default=None,
-        help="Path to GLiNER2 LoRA adapter directory",
+        help="Path to GLiNER2 finetuned model (auto-detects LoRA adapter or full model)",
     )
     parser.add_argument(
         "--gliner2-threshold",
@@ -1009,7 +1154,10 @@ def main():
         )
         if is_main_process():
             if args.gliner2_adapter:
-                logger.info(f"GLiNER2 adapter loaded: {args.gliner2_adapter}")
+                if gliner2_extractor._is_full_model:
+                    logger.info(f"GLiNER2 full finetuned model loaded: {args.gliner2_adapter}")
+                else:
+                    logger.info(f"GLiNER2 LoRA adapter loaded: {args.gliner2_adapter}")
             logger.info(f"GLiNER2 initialized on {world_size} GPU(s)")
 
         # Update config with tool count

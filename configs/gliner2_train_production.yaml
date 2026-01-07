@@ -36,16 +36,16 @@ save_best: true
 save_total_limit: 5
 
 # Early stopping
-early_stopping: true
+early_stopping: false 
 early_stopping_patience: 5
 
 # Logging
 logging_steps: 50
 
 # LoRA settings - High performance
-use_lora: true
-lora_r: 16              # Higher rank for better performance
-lora_alpha: 32          # 2 * r
+use_lora: false 
+lora_r: 32              # Higher rank for better performance
+lora_alpha: 64          # 2 * r
 lora_dropout: 0.05
 lora_target_modules:    # Encoder + task heads for better performance
   - encoder

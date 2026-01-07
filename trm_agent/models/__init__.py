@@ -10,13 +10,19 @@ from .ema import EMA, ModelEMA
 from .heads import DecisionHead, ToolHead, QHead, ContentHead, OutputHead
 from .layers import RMSNorm, SwiGLU, ConvSwiGLU, TransformerLayer, TRMBlock
 from .trm import TRMForToolCalling, TRMOutput
+from .sudoku import SudokuConfig, SudokuOutput, SudokuEmbedding, TRMForSudoku
 
 __all__ = [
     # Config
     "TRMConfig",
+    "SudokuConfig",
     # Model
     "TRMForToolCalling",
     "TRMOutput",
+    # Sudoku
+    "TRMForSudoku",
+    "SudokuOutput",
+    "SudokuEmbedding",
     # Embeddings
     "InputEmbedding",
     "LatentEmbedding",

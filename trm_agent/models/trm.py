@@ -39,6 +39,8 @@ class TRMOutput:
     q_logits: torch.Tensor  # [batch, 1]
     y: torch.Tensor  # [batch, seq_len, hidden_size]
     z: torch.Tensor  # [batch, seq_len, hidden_size]
+    aux_loss: torch.Tensor = None  # scalar - MoE auxiliary loss (optional)
+    intent_logits: torch.Tensor = None  # [batch, num_intents] (optional)
 
 
 class TRMForToolCalling(nn.Module):
@@ -108,7 +110,7 @@ class TRMForToolCalling(nn.Module):
         z: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         n: Optional[int] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Perform n iterations of latent reasoning, then refine y.
 
         Algorithm:
@@ -124,21 +126,25 @@ class TRMForToolCalling(nn.Module):
             n: Number of latent recursions (default: config.n_latent_recursion)
 
         Returns:
-            Updated (y, z) tuple
+            Tuple of (y, z, aux_loss)
         """
         if n is None:
             n = self.config.n_latent_recursion
 
+        total_aux_loss = torch.tensor(0.0, device=x.device)
+
         # n iterations of latent reasoning
         for _ in range(n):
             combined = self._combine_for_z_update(x, y, z)
-            z = self.net(combined, attention_mask)
+            z, aux_loss = self.net(combined, attention_mask)
+            total_aux_loss = total_aux_loss + aux_loss
 
         # Refine y (without x)
         combined = self._combine_for_y_update(y, z)
-        y = self.net(combined, attention_mask)
+        y, aux_loss = self.net(combined, attention_mask)
+        total_aux_loss = total_aux_loss + aux_loss
 
-        return y, z
+        return y, z, total_aux_loss
 
     def deep_recursion(
         self,
@@ -148,7 +154,7 @@ class TRMForToolCalling(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         n: Optional[int] = None,
         T: Optional[int] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """Perform deep recursion: T-1 times without grad, 1 time with grad.
 
         This is the core TRM algorithm that enables learning without
@@ -168,26 +174,30 @@ class TRMForToolCalling(nn.Module):
             - Updated z (detached)
             - Output head predictions (dict)
             - Q head predictions
+            - Auxiliary loss from MoE
         """
         if n is None:
             n = self.config.n_latent_recursion
         if T is None:
             T = self.config.T_deep_recursion
 
-        # T-1 recursions without gradients
+        total_aux_loss = torch.tensor(0.0, device=x.device)
+
+        # T-1 recursions without gradients (no aux_loss contribution)
         with torch.no_grad():
             for _ in range(T - 1):
-                y, z = self.latent_recursion(x, y, z, attention_mask, n)
+                y, z, _ = self.latent_recursion(x, y, z, attention_mask, n)
 
         # Final recursion with gradients
-        y, z = self.latent_recursion(x, y, z, attention_mask, n)
+        y, z, aux_loss = self.latent_recursion(x, y, z, attention_mask, n)
+        total_aux_loss = total_aux_loss + aux_loss
 
         # Get predictions from output heads
         outputs = self.output_head(y)
         q = self.q_head(y)
 
         # Detach y and z for next supervision step
-        return y.detach(), z.detach(), outputs, q
+        return y.detach(), z.detach(), outputs, q, total_aux_loss
 
     def _forward_single_pass(
         self,
@@ -208,7 +218,7 @@ class TRMForToolCalling(nn.Module):
         x = self.input_embedding(input_ids, role_ids, tool_ids, attention_mask)
 
         # Single pass through network (Mamba handles recurrence)
-        h = self.net(x, attention_mask)
+        h, aux_loss = self.net(x, attention_mask)
 
         # Get predictions from output heads
         outputs = self.output_head(h)
@@ -220,6 +230,8 @@ class TRMForToolCalling(nn.Module):
             q_logits=q,
             y=h,  # Use hidden state as y
             z=h,  # Use hidden state as z (no separate latent)
+            aux_loss=aux_loss,
+            intent_logits=outputs.get("intent_logits"),
         )
 
         # For training compatibility, return as list if requested
@@ -263,13 +275,13 @@ class TRMForToolCalling(nn.Module):
                 if step < no_grad_steps:
                     # First K steps: no gradients (TBPTL memory optimization)
                     with torch.no_grad():
-                        y, z, outputs, q = self.deep_recursion(x, y, z, attention_mask)
+                        y, z, outputs, q, _ = self.deep_recursion(x, y, z, attention_mask)
                     # Detach y, z for next step to break gradient chain
                     y = y.detach()
                     z = z.detach()
                 else:
                     # Remaining steps: compute gradients and collect for loss
-                    y, z, outputs, q = self.deep_recursion(x, y, z, attention_mask)
+                    y, z, outputs, q, aux_loss = self.deep_recursion(x, y, z, attention_mask)
                     all_outputs.append(
                         TRMOutput(
                             decision_logits=outputs["decision_logits"],
@@ -277,12 +289,14 @@ class TRMForToolCalling(nn.Module):
                             q_logits=q,
                             y=y,
                             z=z,
+                            aux_loss=aux_loss,
+                            intent_logits=outputs.get("intent_logits"),
                         )
                     )
             return all_outputs
 
         # Single pass (for inference or last step)
-        y, z, outputs, q = self.deep_recursion(x, y, z, attention_mask)
+        y, z, outputs, q, aux_loss = self.deep_recursion(x, y, z, attention_mask)
 
         return TRMOutput(
             decision_logits=outputs["decision_logits"],
@@ -290,6 +304,8 @@ class TRMForToolCalling(nn.Module):
             q_logits=q,
             y=y,
             z=z,
+            aux_loss=aux_loss,
+            intent_logits=outputs.get("intent_logits"),
         )
 
     def forward(
@@ -371,7 +387,7 @@ class TRMForToolCalling(nn.Module):
 
         # Run all supervision steps
         for _ in range(num_steps):
-            y, z, outputs, q = self.deep_recursion(x, y, z, attention_mask)
+            y, z, outputs, q, _ = self.deep_recursion(x, y, z, attention_mask)
 
         return TRMOutput(
             decision_logits=outputs["decision_logits"],
@@ -379,4 +395,5 @@ class TRMForToolCalling(nn.Module):
             q_logits=q,
             y=y,
             z=z,
+            aux_loss=torch.tensor(0.0, device=x.device),  # Not needed for inference
         )

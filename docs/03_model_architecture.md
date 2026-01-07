@@ -4,9 +4,137 @@ This document describes the TRM (Tiny Recursive Model) architecture for tool-cal
 
 > **Note:** Span extraction (slots/params) is handled by **GLiNER2**, not TRM. TRM only handles decision classification (tool_call vs direct_answer) and tool selection.
 
-## Overview
+## Full System Architecture (TRM + GLiNER2)
+
+The system uses a hybrid approach combining two specialized models:
+
+```mermaid
+flowchart TB
+    subgraph Input["📥 Input"]
+        Conv["Conversation History"]
+        Tools["Available Tools"]
+    end
+
+    subgraph Preprocessing["🔄 Preprocessing"]
+        Tokenize["Tokenize & Encode"]
+        BuildText["Build Full Text"]
+    end
+
+    subgraph TRM["🧠 TRM Model (Recursive Reasoning)"]
+        direction TB
+        subgraph TRMEmbed["Embedding"]
+            TokenEmb["Token + Role Embedding"]
+            LatentInit["y_init, z_init"]
+        end
+
+        subgraph TRMLoop["TRM Recursive Loop"]
+            direction TB
+            subgraph HybridNet["TRMBlock (2× HybridBlock)"]
+                Mamba["🔄 Mamba2<br/>O(n) SSM"]
+                MoE["⚡ MoE<br/>4 Experts"]
+                Attn["👁️ Attention<br/>O(n²)"]
+                Mamba --> MoE --> Attn
+            end
+            Z_update["z = net(x + y + z)"]
+            Y_update["y = net(y + z)"]
+        end
+
+        subgraph TRMHeads["Output Heads"]
+            DecHead["DecisionHead<br/>→ tool_call / direct_answer"]
+            ToolHead["ToolHead<br/>→ tool_name"]
+            QHead["QHead<br/>→ confidence"]
+        end
+    end
+
+    subgraph GLiNER["🏷️ GLiNER2 Model (Entity Extraction)"]
+        direction TB
+        subgraph GLiNEREnc["Encoder"]
+            BERT["Transformer Encoder<br/>(+ LoRA Adapter)"]
+        end
+
+        subgraph GLiNERExtract["Extraction"]
+            SlotLabels["Slot Labels<br/>address, phone, name..."]
+            ToolLabels["Tool Param Labels<br/>(based on tool_name)"]
+            NER["NER Extraction"]
+        end
+
+        subgraph GLiNEROut["Outputs"]
+            Slots["Extracted Slots"]
+            ToolArgs["Tool Arguments"]
+        end
+    end
+
+    subgraph Output["📤 Combined Output"]
+        Decision["decision: tool_call"]
+        ToolName["tool_name: get_product"]
+        Arguments["arguments: {product: 'ABC'}"]
+        SlotValues["slots: {name: 'John', phone: '123'}"]
+    end
+
+    %% Flow
+    Conv --> Tokenize --> TRMEmbed
+    Tools --> Tokenize
+    Conv --> BuildText --> GLiNEREnc
+
+    TRMEmbed --> TRMLoop
+    TRMLoop --> TRMHeads
+
+    TRMHeads -->|"decision"| Decision
+    TRMHeads -->|"tool_name"| ToolName
+    TRMHeads -->|"tool_name"| ToolLabels
+
+    GLiNEREnc --> NER
+    SlotLabels --> NER
+    ToolLabels --> NER
+    NER --> Slots --> SlotValues
+    NER --> ToolArgs --> Arguments
+```
+
+### Component Responsibilities
+
+| Component | Model | Responsibility |
+|-----------|-------|----------------|
+| **Decision Classification** | TRM | Predict `tool_call` vs `direct_answer` |
+| **Tool Selection** | TRM | Predict which tool to call |
+| **Confidence Estimation** | TRM | Q-head for halting probability |
+| **Slot Extraction** | GLiNER2 | Extract: address, phone, name, contract_id, etc. |
+| **Tool Argument Extraction** | GLiNER2 | Extract tool-specific parameters |
+
+### Inference Pipeline
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant App
+    participant TRM
+    participant GLiNER2
+
+    User->>App: Send message
+    App->>App: Build conversation history
+
+    par Parallel Processing
+        App->>TRM: Tokenized input
+        TRM->>TRM: Recursive reasoning (N_sup × T × n)
+        TRM-->>App: decision, tool_name, confidence
+
+        App->>GLiNER2: Full text + labels
+        GLiNER2->>GLiNER2: Entity extraction
+        GLiNER2-->>App: slots, tool_args
+    end
+
+    alt decision == "tool_call"
+        App->>App: Build tool call with args
+        App-->>User: Execute tool
+    else decision == "direct_answer"
+        App-->>User: Generate response
+    end
+```
+
+## TRM Model Details
 
 TRM is a recursive reasoning model that uses a **single tiny network** (2 layers, ~7M parameters) to iteratively refine answers through recursive computation.
+
+### TRM Architecture Overview
 
 ```mermaid
 flowchart TB
@@ -875,6 +1003,188 @@ The hybrid architecture replaces standard TransformerLayers with HybridBlocks th
 
 ### Overview
 
+```mermaid
+flowchart LR
+    subgraph Embed["Embedding"]
+        Input["input_ids<br/>role_ids"] --> X["x"]
+        Init["y_init, z_init"] --> YZ["y, z"]
+    end
+
+    subgraph Loop["TRM Loop (N_sup × T × n)"]
+        direction TB
+        Z_update["z = TRMBlock(x + y + z)"]
+        Y_update["y = TRMBlock(y + z)"]
+        Z_update -->|"n times"| Z_update
+        Z_update --> Y_update
+        Y_update -->|"T times"| Z_update
+    end
+
+    subgraph Block["TRMBlock (×2 layers)"]
+        direction TB
+        HB["HybridBlock"]
+
+        subgraph HybridBlock
+            direction LR
+            Mamba["🔄 Mamba2<br/>O(n) SSM"]
+            MoE["⚡ MoE<br/>Top-2 of 4"]
+            Attn["👁️ Attention<br/>O(n²) Global"]
+            Mamba --> MoE --> Attn
+        end
+    end
+
+    subgraph Heads["Output"]
+        Dec["DecisionHead<br/>→ tool_call?"]
+        Tool["ToolHead<br/>→ which tool?"]
+        Q["QHead<br/>→ confidence"]
+    end
+
+    X --> Loop
+    YZ --> Loop
+    Loop --> Block
+    Block --> Loop
+    Loop -->|"final y"| Heads
+```
+
+### Detailed Architecture
+
+```mermaid
+flowchart TB
+    subgraph Input["Input Processing"]
+        input_ids["input_ids [B, L]"]
+        role_ids["role_ids [B, L]"]
+
+        subgraph InputEmbed["InputEmbedding"]
+            TokenEmb["TokenEmbedding"]
+            RoleEmb["RoleEmbedding"]
+            Bias["input_bias [1,1,D]"]
+            AddEmb(("+"))
+            LN["LayerNorm"]
+        end
+    end
+
+    subgraph Latent["Latent Initialization"]
+        y_init["y_init [1,1,D]"]
+        z_init["z_init [1,1,D]"]
+        expand["expand → [B,L,D]"]
+    end
+
+    subgraph TRMLoop["TRM Recursive Loop (N_sup steps)"]
+        subgraph DeepRecursion["Deep Recursion (T iterations)"]
+            subgraph LatentRec["Latent Recursion (n iterations)"]
+                combine_z["x + y + z"]
+                net_z["TRMBlock"]
+                update_z["z = output"]
+            end
+            combine_y["y + z"]
+            net_y["TRMBlock"]
+            update_y["y = output"]
+        end
+    end
+
+    subgraph TRMBlock["TRMBlock (2 HybridBlocks)"]
+        subgraph HB1["HybridBlock 1"]
+            subgraph Mamba1["Mamba Layer"]
+                M1_norm["RMSNorm"]
+                M1_mamba["Mamba2 SSM"]
+                M1_res(("+"))
+            end
+            subgraph MoE1["MoE Layer"]
+                MoE1_norm["RMSNorm"]
+                MoE1_router["Router → Top-2"]
+                subgraph Experts1["4 Experts"]
+                    E1_0["Expert 0<br/>SwiGLU"]
+                    E1_1["Expert 1<br/>SwiGLU"]
+                    E1_2["Expert 2<br/>SwiGLU"]
+                    E1_3["Expert 3<br/>SwiGLU"]
+                end
+                MoE1_combine["Weighted Sum"]
+                MoE1_res(("+"))
+            end
+            subgraph Attn1["Attention Layer"]
+                A1_norm["RMSNorm"]
+                A1_attn["MultiHead Attention<br/>+ RoPE"]
+                A1_res(("+"))
+            end
+        end
+
+        HB2["HybridBlock 2<br/>(same structure)"]
+        FinalNorm["RMSNorm"]
+    end
+
+    subgraph Outputs["Output Heads"]
+        subgraph DecHead["DecisionHead"]
+            D_pool["Mean Pool"]
+            D_mlp["MLP"]
+            D_out["decision_logits [B,1]"]
+        end
+        subgraph ToolHead["ToolHead"]
+            T_pool["Mean Pool"]
+            T_mlp["MLP"]
+            T_out["tool_logits [B,num_tools]"]
+        end
+        subgraph QHead["QHead"]
+            Q_pool["Mean Pool"]
+            Q_mlp["MLP"]
+            Q_out["q_logits [B,1]"]
+        end
+    end
+
+    %% Input flow
+    input_ids --> TokenEmb
+    role_ids --> RoleEmb
+    TokenEmb --> AddEmb
+    RoleEmb --> AddEmb
+    Bias --> AddEmb
+    AddEmb --> LN --> x["x [B,L,D]"]
+
+    %% Latent init
+    y_init --> expand
+    z_init --> expand
+    expand --> y["y [B,L,D]"]
+    expand --> z["z [B,L,D]"]
+
+    %% TRM Loop
+    x --> combine_z
+    y --> combine_z
+    z --> combine_z
+    combine_z --> net_z --> update_z
+    update_z -.->|"repeat n times"| combine_z
+    update_z --> combine_y
+    y --> combine_y
+    combine_y --> net_y --> update_y
+    update_y -.->|"repeat T times"| combine_z
+    update_y -.->|"repeat N_sup times"| combine_z
+
+    %% HybridBlock detail
+    net_z & net_y -.-> TRMBlock
+
+    %% Mamba flow
+    M1_norm --> M1_mamba --> M1_res
+
+    %% MoE flow
+    MoE1_norm --> MoE1_router
+    MoE1_router --> E1_0 & E1_1 & E1_2 & E1_3
+    E1_0 & E1_1 & E1_2 & E1_3 --> MoE1_combine --> MoE1_res
+
+    %% Attention flow
+    A1_norm --> A1_attn --> A1_res
+
+    %% Block sequence
+    M1_res --> MoE1_norm
+    MoE1_res --> A1_norm
+    A1_res --> HB2 --> FinalNorm
+
+    %% Output heads
+    update_y --> y_final["y' [B,L,D]"]
+    y_final --> D_pool --> D_mlp --> D_out
+    y_final --> T_pool --> T_mlp --> T_out
+    y_final --> Q_pool --> Q_mlp --> Q_out
+```
+
+### HybridBlock Structure
+
+Each HybridBlock combines three processing mechanisms with residual connections:
+
 ```
               HybridBlock (per layer)
 ┌─────────────────────────────────────────────────┐
@@ -884,7 +1194,7 @@ The hybrid architecture replaces standard TransformerLayers with HybridBlocks th
 │  RMSNorm → Mamba → + Residual                   │  O(n) sequential
 │    │                                            │
 │    ▼                                            │
-│  RMSNorm → MoE (4 experts, top-2) → + Residual  │  Sparse capacity
+│  RMSNorm → MoE (1 shared + 8 routed, top-2) → +  │  Sparse capacity
 │    │                                            │
 │    ▼                                            │
 │  RMSNorm → MultiHead Attention → + Residual     │  O(n²) global
@@ -893,6 +1203,17 @@ The hybrid architecture replaces standard TransformerLayers with HybridBlocks th
 │  Output                                         │
 └─────────────────────────────────────────────────┘
 ```
+
+| Component | Purpose | Complexity |
+|-----------|---------|------------|
+| **Mamba2** | Sequential processing via SSM | O(n) |
+| **MoE** | Sparse capacity (DeepSeek-V3: 1 shared + 8 routed, top-2) | O(n) |
+| **Attention** | Global context aggregation | O(n²) |
+
+**Recursion Parameters:**
+- `n = 6`: Latent recursion iterations
+- `T = 3`: Deep recursion iterations
+- `N_sup = 16`: Supervision steps (default)
 
 ### Components
 
@@ -949,34 +1270,62 @@ uv add "trm-agent[mamba]"
 - If still failing, use `--mamba-version 1` to use Mamba1 instead
 - Ensure `chunk_size` is power of 2 (default: 256)
 
-#### 2. MoELayer (Mixture of Experts)
+#### 2. MoELayer (DeepSeek-V3 Style Mixture of Experts)
 
-Sparse expert routing for capacity scaling without proportional compute increase.
+DeepSeek-V3 style MoE with auxiliary-loss-free load balancing for sparse capacity scaling.
+
+**Key Features:**
+- **Shared + Routed Experts**: Shared experts (always active) + routed experts (top-k selection)
+- **Sigmoid Gating**: More stable than softmax for expert selection
+- **Dynamic Bias**: P-controller based load balancing (no gradient interference)
+- **Optional Auxiliary Loss**: Sequence-wise auxiliary loss for extreme imbalance prevention
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `num_experts` | 4 | Number of expert MLPs |
-| `num_experts_per_tok` | 2 | Top-k experts per token |
+| `moe_num_shared_experts` | 1 | Shared experts (always active) |
+| `moe_num_routed_experts` | 8 | Routed experts (top-k selection) |
+| `moe_top_k` | 2 | Top-k experts per token |
 | `moe_intermediate_size` | 1024 | Expert MLP hidden size |
+| `moe_use_sigmoid_gating` | true | Sigmoid vs softmax gating |
+| `moe_bias_update_speed` | 0.001 | Bias update rate for load balancing |
+| `moe_seq_aux_loss_weight` | 0.0 | Sequence-wise aux loss (0 = disabled) |
 
 ```mermaid
 flowchart TB
-    x["x [B, L, D]"] --> Router["Router<br/>Linear(D, num_experts)"]
-    Router --> TopK["Top-K Selection<br/>(k=2)"]
-    TopK --> Softmax["Softmax Weights"]
+    x["x [B, L, D]"] --> Shared["Shared Expert(s)<br/>(Always Active)"]
+    x --> Router["Router<br/>Linear(D, num_routed)"]
 
-    subgraph Experts["Expert MLPs"]
-        E1["Expert 0<br/>SwiGLU"]
-        E2["Expert 1<br/>SwiGLU"]
-        E3["Expert 2<br/>SwiGLU"]
-        E4["Expert 3<br/>SwiGLU"]
+    Router --> AddBias["+ Dynamic Bias<br/>(P-controller)"]
+    AddBias --> Sigmoid["Sigmoid Gating"]
+    Sigmoid --> TopK["Top-K Selection<br/>(k=2)"]
+    TopK --> Normalize["Normalize Gates"]
+
+    subgraph RoutedExperts["Routed Expert MLPs"]
+        E0["Expert 0"]
+        E1["Expert 1"]
+        E2["..."]
+        E7["Expert N"]
     end
 
-    x --> E1 & E2 & E3 & E4
-    Softmax --> Combine["Weighted Sum"]
-    E1 & E2 & E3 & E4 --> Combine
-    Combine --> out["output [B, L, D]"]
+    x --> E0 & E1 & E2 & E7
+    Normalize --> Combine["Weighted Sum"]
+    E0 & E1 & E2 & E7 --> Combine
+
+    Shared --> Add["shared_out + routed_out"]
+    Combine --> Add
+    Add --> out["output [B, L, D]"]
+
+    TopK -.-> BiasUpdate["Bias Update<br/>(training only)"]
+    BiasUpdate -.-> AddBias
 ```
+
+**Load Balancing (P-Controller):**
+```
+bias_i += speed × (target_count - actual_count_i)
+```
+- Overloaded experts → bias decreases → fewer tokens routed
+- Underutilized experts → bias increases → more tokens routed
+- No gradient interference (updated with `torch.no_grad()`)
 
 #### 3. MultiHeadAttention
 
@@ -998,10 +1347,14 @@ config = TRMConfig(
     mamba_d_conv=4,
     mamba_expand=2,
 
-    # MoE configuration
-    num_experts=4,
-    num_experts_per_tok=2,
+    # MoE configuration (DeepSeek-V3 style)
+    moe_num_shared_experts=1,       # Always active
+    moe_num_routed_experts=8,       # Top-k selection
+    moe_top_k=2,
     moe_intermediate_size=1024,
+    moe_use_sigmoid_gating=True,    # Sigmoid (not softmax)
+    moe_bias_update_speed=0.001,    # Load balancing
+    moe_seq_aux_loss_weight=0.0,    # Aux-loss-free
 )
 
 # Using Mamba1 (legacy)

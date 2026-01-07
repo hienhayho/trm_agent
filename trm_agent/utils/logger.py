@@ -47,8 +47,8 @@ class ColoredFormatter(logging.Formatter):
         # Level name
         level_name = record.levelname.lower()
 
-        # Location: function:line
-        location = f"{record.funcName}:{record.lineno}"
+        # Location: file_name.function:line
+        location = f"{record.module}.{record.funcName}:{record.lineno}"
 
         # Content
         content = record.getMessage()

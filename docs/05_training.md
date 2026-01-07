@@ -381,6 +381,7 @@ def evaluate():
 | Decision Recall | TP / (TP + FN) | Of all tool_calls, how many detected |
 | Decision F1 | 2 * P * R / (P + R) | Harmonic mean of precision and recall |
 | Tool Accuracy | Correct / Total | Tool name classification accuracy |
+| Intent Accuracy | Correct / Total | Intent prediction accuracy (if enabled) |
 
 ## Checkpointing
 
@@ -440,6 +441,36 @@ uv run python tools/train.py \
     --batch-size 32 \
     --learning-rate 1e-4
 ```
+
+### With Intent Prediction
+
+Enable intent prediction by providing an intent mapping file:
+
+```bash
+uv run python tools/train.py \
+    --config configs/default.yaml \
+    --train-data data/train.jsonl \
+    --intent-map data/intend.json \
+    --output-dir outputs/
+```
+
+**Intent mapping file format (JSON):**
+```json
+{
+  "greeting": "User greets the assistant",
+  "check_balance": "User wants to check account balance",
+  "make_payment": "User wants to make a payment",
+  "get_support": "User needs technical support"
+}
+```
+
+Intent IDs are assigned alphabetically, so:
+- `check_balance` → 0
+- `get_support` → 1
+- `greeting` → 2
+- `make_payment` → 3
+
+The model will predict the next expected intent alongside decision and tool predictions. Intent loss uses **Focal Cross-Entropy** to handle class imbalance.
 
 ### With Validation Split
 

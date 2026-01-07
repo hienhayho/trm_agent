@@ -105,8 +105,19 @@ def find_entity_in_text(text: str, value: str) -> bool:
     return value_normalized in text_lower
 
 
-def convert_trm_sample_to_gliner2(sample: dict, sample_idx: int = 0) -> tuple[Optional[dict], Optional[str]]:
+def convert_trm_sample_to_gliner2(
+    sample: dict,
+    sample_idx: int = 0,
+    args_only: bool = False,
+    tool_call_only: bool = False,
+) -> tuple[Optional[dict], Optional[str]]:
     """Convert a TRM sample to GLiNER2 InputExample format.
+
+    Args:
+        sample: TRM sample dict
+        sample_idx: Sample index for logging
+        args_only: If True, only extract tool arguments (skip slots)
+        tool_call_only: If True, skip direct_answer samples
 
     Returns:
         Tuple of (converted_dict, skip_reason)
@@ -118,6 +129,10 @@ def convert_trm_sample_to_gliner2(sample: dict, sample_idx: int = 0) -> tuple[Op
     tool = sample.get("tool", {})
     decision = sample.get("decision", "unknown")
 
+    # Skip direct_answer if tool_call_only is enabled
+    if tool_call_only and decision != "tool_call":
+        return None, f"skip_direct_answer (decision={decision})"
+
     # Get full conversation text
     text = conversation_to_text(history)
     if not text:
@@ -127,12 +142,13 @@ def convert_trm_sample_to_gliner2(sample: dict, sample_idx: int = 0) -> tuple[Op
     all_values = {}  # name -> value
     found_values = {}  # name -> value (only those found in text)
 
-    # Extract slots
-    for slot_name, slot_value in slots.items():
-        if slot_value and isinstance(slot_value, str) and slot_value.strip():
-            all_values[f"slot:{slot_name}"] = slot_value
-            if find_entity_in_text(text, slot_value):
-                found_values[slot_name] = slot_value
+    # Extract slots (skip if args_only)
+    if not args_only:
+        for slot_name, slot_value in slots.items():
+            if slot_value and isinstance(slot_value, str) and slot_value.strip():
+                all_values[f"slot:{slot_name}"] = slot_value
+                if find_entity_in_text(text, slot_value):
+                    found_values[slot_name] = slot_value
 
     # Extract tool arguments
     if tool and isinstance(tool, dict):
@@ -166,6 +182,8 @@ def convert_trm_jsonl_to_gliner2(
     jsonl_path: Path,
     max_samples: Optional[int] = None,
     log_skipped: bool = True,
+    args_only: bool = False,
+    tool_call_only: bool = False,
 ) -> tuple[list[dict], dict]:
     """Convert TRM JSONL dataset to GLiNER2 format.
 
@@ -173,6 +191,8 @@ def convert_trm_jsonl_to_gliner2(
         jsonl_path: Path to TRM JSONL file
         max_samples: Maximum samples to convert (None for all)
         log_skipped: Whether to log skipped samples with reasons
+        args_only: If True, only extract tool arguments (skip slots)
+        tool_call_only: If True, skip direct_answer samples
 
     Returns:
         Tuple of (samples_list, stats_dict)
@@ -195,7 +215,9 @@ def convert_trm_jsonl_to_gliner2(
 
             try:
                 sample = json.loads(line)
-                gliner2_sample, skip_reason = convert_trm_sample_to_gliner2(sample, total)
+                gliner2_sample, skip_reason = convert_trm_sample_to_gliner2(
+                    sample, total, args_only=args_only, tool_call_only=tool_call_only
+                )
 
                 if gliner2_sample:
                     samples.append(gliner2_sample)
@@ -238,7 +260,11 @@ def convert_trm_jsonl_to_gliner2(
 # ============================================================================
 
 
-def load_gliner2_data(data_path: Path) -> list[InputExample]:
+def load_gliner2_data(
+    data_path: Path,
+    args_only: bool = False,
+    tool_call_only: bool = False,
+) -> list[InputExample]:
     """Load GLiNER2 training data from pickle, JSON, or TRM JSONL file.
 
     Automatically detects format:
@@ -248,6 +274,8 @@ def load_gliner2_data(data_path: Path) -> list[InputExample]:
 
     Args:
         data_path: Path to data file
+        args_only: If True, only extract tool arguments (skip slots) - JSONL only
+        tool_call_only: If True, skip direct_answer samples - JSONL only
 
     Returns:
         List of InputExample objects
@@ -256,8 +284,16 @@ def load_gliner2_data(data_path: Path) -> list[InputExample]:
 
     if suffix == ".jsonl":
         # TRM format - convert automatically
-        logger.info("Detected TRM JSONL format, converting to GLiNER2...")
-        raw_data, stats = convert_trm_jsonl_to_gliner2(data_path)
+        mode_info = []
+        if args_only:
+            mode_info.append("args-only")
+        if tool_call_only:
+            mode_info.append("tool-call-only")
+        mode_str = f" ({', '.join(mode_info)})" if mode_info else ""
+        logger.info(f"Detected TRM JSONL format, converting to GLiNER2{mode_str}...")
+        raw_data, stats = convert_trm_jsonl_to_gliner2(
+            data_path, args_only=args_only, tool_call_only=tool_call_only
+        )
         skipped = stats['total_samples'] - stats['converted_samples']
         logger.info(f"Converted {stats['converted_samples']}/{stats['total_samples']} samples (skipped: {skipped})")
         if stats.get("skip_reasons"):
@@ -285,11 +321,17 @@ def load_gliner2_data(data_path: Path) -> list[InputExample]:
     return examples
 
 
-def load_multiple_gliner2_data(data_paths: list[Path]) -> list[InputExample]:
+def load_multiple_gliner2_data(
+    data_paths: list[Path],
+    args_only: bool = False,
+    tool_call_only: bool = False,
+) -> list[InputExample]:
     """Load and concatenate GLiNER2 training data from multiple files.
 
     Args:
         data_paths: List of paths to data files
+        args_only: If True, only extract tool arguments (skip slots)
+        tool_call_only: If True, skip direct_answer samples
 
     Returns:
         Concatenated list of InputExample objects
@@ -298,7 +340,7 @@ def load_multiple_gliner2_data(data_paths: list[Path]) -> list[InputExample]:
 
     for i, data_path in enumerate(data_paths):
         logger.info(f"[{i + 1}/{len(data_paths)}] Loading: {data_path}")
-        examples = load_gliner2_data(data_path)
+        examples = load_gliner2_data(data_path, args_only=args_only, tool_call_only=tool_call_only)
         all_examples.extend(examples)
         logger.info(f"Loaded {len(examples)} examples (total: {len(all_examples)})")
 
@@ -309,6 +351,8 @@ def load_and_split_gliner2_data(
     data_paths: list[Path],
     val_split: float = 0.1,
     seed: int = 42,
+    args_only: bool = False,
+    tool_call_only: bool = False,
 ) -> tuple[list[InputExample], list[InputExample]]:
     """Load GLiNER2 data and split each file into train/val.
 
@@ -319,6 +363,8 @@ def load_and_split_gliner2_data(
         data_paths: List of paths to data files
         val_split: Fraction of each file to use for validation (0.0 to 1.0)
         seed: Random seed for reproducibility
+        args_only: If True, only extract tool arguments (skip slots)
+        tool_call_only: If True, skip direct_answer samples
 
     Returns:
         Tuple of (train_examples, val_examples)
@@ -331,7 +377,7 @@ def load_and_split_gliner2_data(
 
     for i, data_path in enumerate(data_paths):
         logger.info(f"[{i + 1}/{len(data_paths)}] Loading: {data_path}")
-        examples = load_gliner2_data(data_path)
+        examples = load_gliner2_data(data_path, args_only=args_only, tool_call_only=tool_call_only)
 
         # Shuffle and split
         examples_copy = list(examples)
@@ -435,6 +481,12 @@ def merge_config_with_args(config: dict, args: argparse.Namespace) -> dict:
     if args.no_fp16:
         config["fp16"] = False
 
+    # Handle boolean flags (always override if set)
+    if args.args_only:
+        config["args_only"] = True
+    if args.tool_call_only:
+        config["tool_call_only"] = True
+
     return config
 
 
@@ -480,6 +532,9 @@ def train_gliner2_lora(
     save_adapter_only: bool = True,
     # Data split
     val_split: float = 0.0,  # Split ratio for validation (0.0 = no split, use val_data_paths)
+    # Data filtering (for TRM JSONL format)
+    args_only: bool = False,  # Only extract tool arguments (skip slots)
+    tool_call_only: bool = False,  # Skip direct_answer samples
     # Other
     seed: int = 42,
 ):
@@ -507,6 +562,20 @@ def train_gliner2_lora(
     else:
         logger.info("Single GPU training")
 
+    # If tool_call_only is enabled, also enable args_only (tool calls have args, not slots)
+    if tool_call_only and not args_only:
+        args_only = True
+        logger.info("Note: --tool-call-only implies --args-only (auto-enabled)")
+
+    # Log data filtering options
+    if args_only or tool_call_only:
+        filter_opts = []
+        if args_only:
+            filter_opts.append("args-only")
+        if tool_call_only:
+            filter_opts.append("tool-call-only")
+        logger.info(f"Data filtering: {', '.join(filter_opts)}")
+
     # Load training data
     val_examples = None
 
@@ -514,13 +583,16 @@ def train_gliner2_lora(
         # Split validation from training data (per-file) - takes priority over val_data_paths
         logger.info(f"Loading and splitting training data ({len(train_data_paths)} file(s), val_split={val_split}):")
         train_examples, val_examples = load_and_split_gliner2_data(
-            train_data_paths, val_split=val_split, seed=seed
+            train_data_paths, val_split=val_split, seed=seed,
+            args_only=args_only, tool_call_only=tool_call_only
         )
         logger.info(f"Total: {len(train_examples)} training, {len(val_examples)} validation examples")
     else:
         # Load all training data (multiple files concatenated)
         logger.info(f"Loading training data ({len(train_data_paths)} file(s)):")
-        train_examples = load_multiple_gliner2_data(train_data_paths)
+        train_examples = load_multiple_gliner2_data(
+            train_data_paths, args_only=args_only, tool_call_only=tool_call_only
+        )
         logger.info(f"Total: {len(train_examples)} training examples")
 
         # Load validation data if provided (multiple files concatenated)
@@ -528,7 +600,9 @@ def train_gliner2_lora(
             valid_val_paths = [p for p in val_data_paths if p.exists()]
             if valid_val_paths:
                 logger.info(f"Loading validation data ({len(valid_val_paths)} file(s)):")
-                val_examples = load_multiple_gliner2_data(valid_val_paths)
+                val_examples = load_multiple_gliner2_data(
+                    valid_val_paths, args_only=args_only, tool_call_only=tool_call_only
+                )
                 logger.info(f"Total: {len(val_examples)} validation examples")
 
     # Get entity labels
@@ -722,6 +796,18 @@ def main():
     parser.add_argument("--logging-steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
 
+    # Data filtering (for TRM JSONL format)
+    parser.add_argument(
+        "--args-only",
+        action="store_true",
+        help="Only extract tool arguments (skip slots). Useful for GLiNER2 training.",
+    )
+    parser.add_argument(
+        "--tool-call-only",
+        action="store_true",
+        help="Skip direct_answer samples, only train on tool_call samples.",
+    )
+
     args = parser.parse_args()
 
     # Load config from file or use defaults
@@ -760,6 +846,8 @@ def main():
             "lora_target_modules": args.lora_target_modules or ["encoder", "span_rep", "classifier"],
             "save_adapter_only": True,
             "seed": args.seed or 42,
+            "args_only": args.args_only,
+            "tool_call_only": args.tool_call_only,
         }
 
     # Validate required fields
@@ -800,6 +888,8 @@ def main():
         lora_target_modules=config.get("lora_target_modules", ["encoder", "span_rep", "classifier"]),
         save_adapter_only=config.get("save_adapter_only", True),
         val_split=config.get("val_split", 0.0),
+        args_only=config.get("args_only", False),
+        tool_call_only=config.get("tool_call_only", False),
         seed=config.get("seed", 42),
     )
 
